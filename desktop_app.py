@@ -2,13 +2,23 @@
 Image Metadata Desktop App (PySide6)
 -----------------------------------
 
-• App desktop (Windows/macOS/Linux) com 2 ferramentas em abas:
+• App desktop (Windows/macOS/Linux) com 3 ferramentas em abas:
   1) Metadados: drag & drop, abrir arquivo, caminho absoluto → JSON seguro.
   2) Hierarquia (visual): editor de árvore + gerenciador de **templates de hierarquia**:
      - Criar template por texto (uma linha por caminho; '/' separa níveis)
-     - Salvar/Carregar templates em JSON
+     - Salvar/Carregar templates em JSON (persistido em %APPDATA%/Library/.config)
      - Aplicar template em múltiplas pastas selecionadas (sem duplicar nós)
      - Atalhos rápidos (3k/4k com jpg/png)
+     - Lazy loading do FS com setinha/expander
+
+  3) File Penerator (NOVO):
+     - Escolher diretório de origem (lazy, igual à Hierarquia)
+     - Botão “Penerator” abre diálogo com filtros multi-seleção:
+         ▸ Extensões (auto detectadas no diretório)
+         ▸ Resoluções/buckets (4k/5k; auto detecta disponíveis)
+     - Solicita pasta destino para **criar estrutura** combinando filtros (ex.: jpg/4k, png/5k, …)
+     - Move as imagens da origem para dentro dos buckets correspondentes (ext/res)
+     - Após mover, pergunta um **segundo destino opcional** para replicar SOMENTE a estrutura (sem arquivos)
 
 Instalação (cobertura ampla de formatos)
   pip install -U PySide6 pillow pillow-heif pillow-avif-plugin pillow-jxl-plugin \
@@ -26,9 +36,10 @@ from __future__ import annotations
 import json
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple, Set
 import os
 import sys
+import shutil
 
 from PIL import Image, ImageCms
 from PIL import ImageFile
@@ -53,7 +64,7 @@ try:
 except Exception:
     pass
 
-# ------------------ Utilitários (metadados) ------------------
+# ------------------ Utilitários (metadados/imagens) ------------------
 
 def rational_to_float(v: Any):
     try:
@@ -140,7 +151,8 @@ def extract_icc_name(icc_bytes: Optional[bytes]) -> Optional[str]:
         return ImageCms.getProfileName(profile)
     except Exception:
         return "ICC profile (descrição indisponível)"
-    
+
+
 def _app_data_dir() -> Path:
     if sys.platform.startswith("win"):
         base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
@@ -150,6 +162,7 @@ def _app_data_dir() -> Path:
     else:
         base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
         return Path(base) / "ImgMetaApp"
+
 
 def _templates_json_path() -> Path:
     return _app_data_dir() / "templates.json"
@@ -298,49 +311,18 @@ def open_any_image(source: Any) -> Image.Image:
 
 
 # ------------------ UI (PySide6) ------------------
-from PySide6.QtCore import Qt, QTimer, QObject, QEvent, QPoint, QRect  # <<-- acrescente QObject, QEvent
+from PySide6.QtCore import Qt, QTimer, QObject, QEvent, QPoint, QRect
 from PySide6.QtWidgets import QDialog, QFileDialog
 from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QLineEdit, QFileDialog, QPlainTextEdit, QMessageBox,
+    QLabel, QPushButton, QLineEdit, QPlainTextEdit, QMessageBox,
     QMenuBar, QTabWidget, QTreeWidget, QTreeWidgetItem, QAbstractItemView,
-    QHeaderView, QGroupBox, QComboBox, QInputDialog,
-    QDialog, QDialogButtonBox, QProgressDialog, QStyle   # <--- AQUI
+    QHeaderView, QGroupBox, QComboBox, QInputDialog,QGridLayout, QToolButton,
+    QDialogButtonBox, QProgressDialog, QStyle, QListWidget, QListWidgetItem, QCheckBox
 )
 
-def _choose_open_file(parent, title="Abrir arquivo", name_filter=""):
-    dlg = QFileDialog(parent, title)
-    dlg.setOption(QFileDialog.DontUseNativeDialog, True)
-    if name_filter:
-        dlg.setNameFilter(name_filter)
-    dlg.setFileMode(QFileDialog.ExistingFile)
-    if dlg.exec() == QDialog.Accepted:
-        files = dlg.selectedFiles()
-        return (files[0], name_filter) if files else ("", name_filter)
-    return ("", name_filter)
-
-def _choose_save_file(parent, title="Salvar como", name_filter=""):
-    dlg = QFileDialog(parent, title)
-    dlg.setOption(QFileDialog.DontUseNativeDialog, True)
-    dlg.setAcceptMode(QFileDialog.AcceptSave)
-    if name_filter:
-        dlg.setNameFilter(name_filter)
-    if dlg.exec() == QDialog.Accepted:
-        files = dlg.selectedFiles()
-        return (files[0], name_filter) if files else ("", name_filter)
-    return ("", name_filter)
-
-def _choose_directory(parent, title="Escolher pasta"):
-    dlg = QFileDialog(parent, title)
-    dlg.setOption(QFileDialog.DontUseNativeDialog, True)
-    dlg.setFileMode(QFileDialog.Directory)
-    dlg.setOption(QFileDialog.ShowDirsOnly, True)
-    if dlg.exec() == QDialog.Accepted:
-        files = dlg.selectedFiles()
-        return files[0] if files else ""
-    return ""
-
+# ---------- Helpers de diálogos/centrais ----------
 class _DialogNormalizer(QObject):
     def __init__(self, width=500, height=300):
         super().__init__()
@@ -356,7 +338,7 @@ class _DialogNormalizer(QObject):
                     obj.setFixedSize(self.w, self.h)
                 except Exception:
                     pass
-                # centralizar na tela do pai (ou primária)
+                # centralizar
                 try:
                     parent = obj.parent()
                     win = parent.window() if parent else None
@@ -370,19 +352,18 @@ class _DialogNormalizer(QObject):
                         obj.move(fg.topLeft())
                 except Exception:
                     pass
-            # aplica depois do show para garantir geometria correta
             QTimer.singleShot(0, apply)
         return super().eventFilter(obj, ev)
 
-def install_dialog_normalizer(app: QApplication, width=200, height=100):
+
+def install_dialog_normalizer(app: QApplication, width=500, height=300):
     norm = _DialogNormalizer(width, height)
     app.installEventFilter(norm)
-    # evitar garbage collection
-    app._dialog_normalizer = norm
+    app._dialog_normalizer = norm  # evitar GC
+
 
 def _center_dialog(widget, parent):
     try:
-        # Centro no monitor da janela principal (se houver), senão no monitor primário
         parent_win = parent.window() if parent else None
         if parent_win and parent_win.isVisible() and parent_win.screen():
             screen_geo = parent_win.screen().availableGeometry()
@@ -391,12 +372,13 @@ def _center_dialog(widget, parent):
             screen_geo = scr.availableGeometry() if scr else None
         if screen_geo:
             geo = widget.frameGeometry()
-            geo.setWidth(200)
-            geo.setHeight(100)
+            geo.setWidth(widget.width() or 500)
+            geo.setHeight(widget.height() or 300)
             geo.moveCenter(screen_geo.center())
             widget.move(geo.topLeft())
     except Exception:
         pass
+
 
 def _centered_messagebox(parent, icon, title, text,
                          buttons=QMessageBox.Ok,
@@ -409,9 +391,9 @@ def _centered_messagebox(parent, icon, title, text,
     if defaultButton != QMessageBox.NoButton:
         m.setDefaultButton(defaultButton)
     m.setWindowModality(Qt.ApplicationModal)
-    m.setFixedSize(200, 100)   # força 200x100
     _center_dialog(m, parent)
     return m.exec()
+
 
 def _patch_qmessagebox_centered():
     def information(parent, title, text,
@@ -434,13 +416,14 @@ def _patch_qmessagebox_centered():
                  defaultButton=QMessageBox.NoButton):
         return _centered_messagebox(parent, QMessageBox.Question, title, text, buttons, defaultButton)
 
-    # Monkey-patch
     QMessageBox.information = staticmethod(information)
     QMessageBox.warning     = staticmethod(warning)
     QMessageBox.critical    = staticmethod(critical)
     QMessageBox.question    = staticmethod(question)
 
 _patch_qmessagebox_centered()
+
+
 # ======= Aba 1: Metadados =======
 class DropArea(QLabel):
     def __init__(self):
@@ -463,19 +446,13 @@ class DropArea(QLabel):
                 if hasattr(win, 'analyze_path'):
                     win.analyze_path(paths[0])
 
-class ReplaceDialog(QDialog):
-    def __init__(self, parent=None, current_name: str = ""):
-        super().__init__(parent)
-        # ... seu código ...
-        self.setFixedSize(200, 100)  # opcional: mesmo padrão 200x100
 
-  
+class ReplaceDialog(QDialog):
     def __init__(self, parent=None, current_name: str = ""):
         super().__init__(parent)
         self.setWindowTitle("Renomear (replace)")
         lay = QVBoxLayout(self)
 
-        # Linha com [procurar]  →  [substituir]
         hl = QHBoxLayout()
         self.find_edit = QLineEdit()
         self.find_edit.setPlaceholderText("procurar (ex.: shot_10)")
@@ -489,30 +466,28 @@ class ReplaceDialog(QDialog):
         hl.addWidget(self.repl_edit)
         lay.addLayout(hl)
 
-        # Dica com nome atual
         if current_name:
             hint = QLabel(f"Nome atual: <b>{current_name}</b>")
             hint.setStyleSheet("color: #666;")
             lay.addWidget(hint)
 
-        # Botões OK/Cancelar
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         lay.addWidget(btns)
-        self.setFixedSize(200, 100)
 
     def showEvent(self, e):
         super().showEvent(e)
         _center_dialog(self, self.parent())
+
     def values(self):
         return self.find_edit.text(), self.repl_edit.text()
 
+
 # ======= Aba 2: Hierarquia (visual + templates) =======
-# ======= Aba 2: Hierarquia (multi-abas + templates) =======
 class HierarchyTab(QWidget):
     """
-    Agora com múltiplas abas: cada aba possui sua própria árvore (QTreeWidget)
+    Múltiplas abas internas: cada aba possui sua própria árvore (QTreeWidget)
     e campo de 'Pasta base'. Templates são compartilhados entre as abas.
     """
     ROLE_FULLPATH = Qt.UserRole + 1
@@ -531,7 +506,6 @@ class HierarchyTab(QWidget):
                 self.base_edit.setText(base_path)
                 self.owner._load_fs_into_page(self, base_path)
 
-        
         def _build_ui(self):
             v = QVBoxLayout(self)
 
@@ -541,8 +515,8 @@ class HierarchyTab(QWidget):
             self.base_edit.setPlaceholderText("Pasta base desta aba…")
             btn_pick = QPushButton("Escolher…")
             btn_pick.clicked.connect(lambda: self.owner.pick_base())  # usa página ativa
-            # Ler hierarquia SEMPRE abre nova aba (exigência do usuário)
-            btn_load_fs = QPushButton("Abrir pasta...")
+            # Ler hierarquia SEMPRE abre nova aba
+            btn_load_fs = QPushButton("Abrir pasta…")
             btn_load_fs.clicked.connect(lambda: self.owner.load_hierarchy_dialog())
             h_base.addWidget(btn_load_fs)
             h_base.addWidget(self.base_edit)
@@ -595,17 +569,93 @@ class HierarchyTab(QWidget):
         super().__init__(parent)
         self._vp2page = {}
         self.templates: Dict[str, List[List[str]]] = {}
-        self.multi_mark_mode = False  # manutenção de API
+        self.multi_mark_mode = False
         self._build_ui()
-        self._busy_timer = None
-        self._progress = None
+        self._busy_timer: Optional[QTimer] = None
+        self._progress: Optional[QProgressDialog] = None
         self._load_templates_from_disk()
         if not self.templates:
             self._register_quick_template_3k4k()
             self._save_templates_to_disk()
-
-        # começa com uma aba vazia
         self._add_empty_tab()
+
+         # --- Templates: helpers de parsing e diálogos (ADD) ---
+    def _parse_template_lines(self, text: str) -> List[List[str]]:
+        """
+        Converte texto (uma linha por caminho; '/' separa níveis) em lista de listas.
+        Linhas em branco ou começando com '#' são ignoradas.
+        """
+        paths: List[List[str]] = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p.strip() for p in line.split("/") if p.strip()]
+            if parts:
+                paths.append(parts)
+        return paths
+
+    def create_template_dialog(self):
+        name, ok = QInputDialog.getText(self, "Novo template", "Nome do template:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if name in self.templates:
+            QMessageBox.warning(self, "Template", "Já existe um template com esse nome.")
+            return
+
+        example = "3k/jpg\n3k/png\n4k/jpg\n4k/png"
+        text, ok2 = QInputDialog.getMultiLineText(
+            self, "Novo template",
+            "Digite a hierarquia (uma linha por caminho; use '/' para níveis):",
+            example
+        )
+        if not ok2:
+            return
+
+        paths = self._parse_template_lines(text)
+        if not paths:
+            QMessageBox.information(self, "Template", "Nenhum caminho válido informado.")
+            return
+
+        self.templates[name] = paths
+        self._refresh_templates_combo(select_name=name)
+        self._save_templates_to_disk()
+        QMessageBox.information(self, "Template", "Template criado e salvo.")
+
+    def edit_current_template_dialog(self):
+        name = self.cb_templates.currentText()
+        if not name or name not in self.templates:
+            QMessageBox.information(self, "Editar template", "Selecione um template.")
+            return
+
+        current_lines = "\n".join("/".join(p) for p in self.templates[name])
+        new_text, ok = QInputDialog.getMultiLineText(
+            self, f"Editar template: {name}",
+            "Edite a hierarquia (uma linha por caminho; use '/' para níveis):",
+            current_lines
+        )
+        if not ok:
+            return
+
+        new_paths = self._parse_template_lines(new_text)
+        if not new_paths:
+            QMessageBox.information(self, "Editar template", "Nenhum caminho válido informado.")
+            return
+
+        self.templates[name] = new_paths
+        self._save_templates_to_disk()
+        QMessageBox.information(self, "Editar template", "Template atualizado e salvo.")
+
+    def delete_current_template(self):
+        name = self.cb_templates.currentText()
+        if not name or name not in self.templates:
+            return
+        if QMessageBox.question(self, "Remover template", f"Remover '{name}'?") == QMessageBox.Yes:
+            del self.templates[name]
+            self._refresh_templates_combo()
+            self._save_templates_to_disk()
+            QMessageBox.information(self, "Template", "Template removido.")
 
     def eventFilter(self, obj, ev):
         # Só nos interessa clique no viewport de uma tree nossa
@@ -616,30 +666,26 @@ class HierarchyTab(QWidget):
             idx = tree.indexAt(pos)
             if idx.isValid():
                 row_rect = tree.visualRect(idx)
-                # profundidade para calcular a coluna do indicador (expander)
                 depth = 0
                 p = idx.parent()
                 while p.isValid():
                     depth += 1
                     p = p.parent()
                 x0 = row_rect.left() + depth * tree.indentation()
-                indicator_width = 18  # largura razoável do triângulo
+                indicator_width = 18
                 indicator_rect = QRect(x0, row_rect.top(), indicator_width, row_rect.height())
-
-                # Se clicou na área do expander: alterna expandido e NÃO seleciona
                 if indicator_rect.contains(pos):
                     tree.setExpanded(idx, not tree.isExpanded(idx))
-                    return True  # consumiu o evento → evita seleção
-
+                    return True
         return super().eventFilter(obj, ev)
 
     # ---------------- UI principal ----------------
     def _begin_busy(self, text: str = "Carregando…"):
-        # só exibe se demorar (>300ms)
-        from PySide6.QtCore import QTimer
         if self._busy_timer:
-            try: self._busy_timer.stop()
-            except Exception: pass
+            try:
+                self._busy_timer.stop()
+            except Exception:
+                pass
             self._busy_timer = None
 
         self._busy_timer = QTimer(self)
@@ -653,17 +699,18 @@ class HierarchyTab(QWidget):
                 self._progress.setWindowModality(Qt.ApplicationModal)
                 self._progress.setMinimumWidth(360)
                 self._progress.show()
-                self._progress.setFixedSize(200, 100)  # se quiser padronizar o tamanho
                 _center_dialog(self._progress, self)
                 QApplication.processEvents()
 
         self._busy_timer.timeout.connect(_show)
-        self._busy_timer.start(300)  # só aparece após 300ms
+        self._busy_timer.start(300)
 
     def _end_busy(self):
         if self._busy_timer:
-            try: self._busy_timer.stop()
-            except Exception: pass
+            try:
+                self._busy_timer.stop()
+            except Exception:
+                pass
             self._busy_timer.deleteLater()
             self._busy_timer = None
         if self._progress:
@@ -675,30 +722,26 @@ class HierarchyTab(QWidget):
             self._progress = None
 
     def _pump_events_periodically(self, counter: int, every: int = 64):
-        """Chame durante loops longos para manter o loading animado."""
         if counter % every == 0:
             QApplication.processEvents()
+
     def _build_ui(self):
         v = QVBoxLayout(self)
-
-        # Abas
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
         self.tabs.tabCloseRequested.connect(self._on_tab_close)
         v.addWidget(self.tabs)
 
-        # Barra de controles de abas
         h_tabs = QHBoxLayout()
         btn_new_tab = QPushButton("+ Nova aba vazia")
         btn_new_tab.clicked.connect(self._add_empty_tab)
-        btn_open_fs = QPushButton("Abrir pasta...")
+        btn_open_fs = QPushButton("Abrir pasta…")
         btn_open_fs.clicked.connect(self.load_hierarchy_dialog)
         h_tabs.addWidget(btn_new_tab)
         h_tabs.addWidget(btn_open_fs)
         h_tabs.addStretch(1)
         v.addLayout(h_tabs)
 
-        # Templates compartilhados
         v.addWidget(self._build_templates_group())
 
     def _on_tab_close(self, idx: int):
@@ -722,60 +765,47 @@ class HierarchyTab(QWidget):
         finally:
             self._end_busy()
 
-    # Página (aba) ativa
     def _cur_page(self) -> Optional['_Page']:
         w = self.tabs.currentWidget()
         return w if isinstance(w, HierarchyTab._Page) else None
 
-    # ----------------- Diálogos e FS -----------------
     def load_hierarchy_dialog(self):
         base = _choose_directory(self, "Escolher pasta para abrir")
         if not base:
             return
-
         pg = self._cur_page()
-        # “Vazia” = nenhuma raiz na árvore
         is_empty = bool(pg and pg.tree.topLevelItemCount() == 0)
-
         title = Path(base).name or "Hierarquia"
         if is_empty:
-            # abre na aba atual
             self._begin_busy(f"Abrindo “{title}”…")
             try:
                 pg.base_edit.setText(base)
                 self._load_fs_into_page(pg, base)
-                # renomeia o título da aba atual
                 idx = self.tabs.indexOf(pg)
                 if idx != -1:
                     self.tabs.setTabText(idx, title)
             finally:
                 self._end_busy()
         else:
-            # já tem coisa: abre em uma nova aba
             self._add_tab_from_fs(base)
-
 
     def _load_fs_into_page(self, page: '_Page', base_dir: str):
         try:
             p = Path(base_dir)
             if not p.exists() or not p.is_dir():
                 raise FileNotFoundError("Pasta inválida")
-
-            # raiz com lazy
             root = self._make_dir_item(page, p.name, str(p))
             page.tree.addTopLevelItem(root)
             self._ensure_buttons(page, root)
-            # adiciona um filho dummy para mostrar a setinha
             root.addChild(QTreeWidgetItem([self.DUMMY_MARK, ""]))
-
-            page.tree.expandItem(root)  # se quiser já abrir a raiz
+            page.tree.expandItem(root)
         except Exception as e:
             QMessageBox.critical(self, "Erro", f"Falha ao abrir: {e}")
 
     def _make_fs_item(self, page: '_Page', name: str, full_path: str, is_dir: bool) -> QTreeWidgetItem:
         it = self._make_item(page, name, is_dir=is_dir)
         it.setData(0, self.ROLE_FULLPATH, full_path)
-        it.setData(0, self.ROLE_IS_DIR, 1 if is_dir else 0)  # redundante, mas ok
+        it.setData(0, self.ROLE_IS_DIR, 1 if is_dir else 0)
         try:
             icon = QApplication.style().standardIcon(QStyle.SP_DirIcon if is_dir else QStyle.SP_FileIcon)
             it.setIcon(0, icon)
@@ -792,23 +822,19 @@ class HierarchyTab(QWidget):
     def _load_children_for_item(self, page: '_Page', parent_item: QTreeWidgetItem, parent_path: str):
         try:
             with os.scandir(parent_path) as it:
-                dirs = []
-                files = []
+                dirs, files = [], []
                 for e in it:
                     try:
-                        if e.is_dir(follow_symlinks=True):      # ← True
+                        if e.is_dir(follow_symlinks=True):
                             dirs.append(e)
-                        elif e.is_file(follow_symlinks=True):   # ← True
+                        elif e.is_file(follow_symlinks=True):
                             files.append(e)
                     except Exception:
                         continue
-
             dirs.sort(key=lambda e: e.name.lower())
             files.sort(key=lambda e: e.name.lower())
 
             created_dirs = 0
-
-            # Pastas primeiro (com dummy para lazy)
             for idx, e in enumerate(dirs, 1):
                 child = self._make_dir_item(page, e.name, e.path)
                 parent_item.addChild(child)
@@ -817,7 +843,6 @@ class HierarchyTab(QWidget):
                 created_dirs += 1
                 self._pump_events_periodically(idx, every=64)
 
-            # Depois arquivos (sem dummy)
             for idx, e in enumerate(files, 1):
                 child = self._make_file_item(page, e.name, e.path)
                 parent_item.addChild(child)
@@ -825,15 +850,12 @@ class HierarchyTab(QWidget):
                 self._pump_events_periodically(idx, every=64)
 
             parent_item.setData(0, self.ROLE_HAS_SUBDIRS, 1 if created_dirs > 0 else 0)
-
         except PermissionError:
             parent_item.setData(0, self.ROLE_HAS_SUBDIRS, 0)
         except Exception:
             parent_item.setData(0, self.ROLE_HAS_SUBDIRS, 0)
 
-    
     def _on_item_expanded(self, it: QTreeWidgetItem):
-        # Se o primeiro filho é um dummy, carregue de verdade
         if it.childCount() == 1 and it.child(0).text(0) == self.DUMMY_MARK:
             it.takeChildren()
             pg = self._page_of_item(it)
@@ -842,7 +864,6 @@ class HierarchyTab(QWidget):
             base = it.data(0, self.ROLE_FULLPATH)
             if not base:
                 return
-            # spinner (mostra só se demorar > 300ms)
             self._begin_busy(f"Lendo “{Path(base).name}”…")
             try:
                 self._load_children_for_item(pg, it, str(base))
@@ -850,11 +871,9 @@ class HierarchyTab(QWidget):
                 self._end_busy()
 
     def _on_item_collapsed(self, it: QTreeWidgetItem):
-        # Ao colapsar, libere memória dos widgets e filhos
         self._free_subtree_widgets(it)
         has_sub = bool(it.data(0, self.ROLE_HAS_SUBDIRS))
         it.takeChildren()
-        # recoloca um dummy só se tem subpastas conhecidas
         if has_sub:
             it.addChild(QTreeWidgetItem([self.DUMMY_MARK, ""]))
 
@@ -872,33 +891,11 @@ class HierarchyTab(QWidget):
             for i in range(cur.childCount()):
                 stack.append(cur.child(i))
 
-
-    def _populate_children_from_dir(self, page: '_Page', parent_item: QTreeWidgetItem, parent_path: Path):
-        try:
-            subdirs = sorted([d for d in parent_path.iterdir() if d.is_dir()], key=lambda d: d.name.lower())
-        except Exception:
-            subdirs = []
-
-        for i, d in enumerate(subdirs, 1):
-            child_item = self._make_item(page, d.name, is_dir=True)
-            parent_item.addChild(child_item)
-
-            # ✅ dê botões de ação para TODA pasta criada
-            self._ensure_buttons(page, child_item)
-
-            # recursão
-            self._populate_children_from_dir(page, child_item, d)
-
-            # mantém o spinner fluindo (opcional)
-            self._pump_events_periodically(i, every=64)
-
-
     # ----------------- Grupo de Templates -----------------
     def _build_templates_group(self) -> QGroupBox:
         g = QGroupBox("Templates de Hierarquia (compartilhados)")
         lay = QVBoxLayout(g)
 
-        # Linha 1
         h1 = QHBoxLayout()
         self.cb_templates = QComboBox()
         self.cb_templates.setEditable(False)
@@ -911,7 +908,6 @@ class HierarchyTab(QWidget):
         h1.addWidget(btn_apply)
         lay.addLayout(h1)
 
-        # Linha 2
         h2 = QHBoxLayout()
         btn_new = QPushButton("Novo template…")
         btn_new.clicked.connect(self.create_template_dialog)
@@ -925,18 +921,8 @@ class HierarchyTab(QWidget):
         h2.addStretch(1)
         lay.addLayout(h2)
 
-        # Linha 3
         h3 = QHBoxLayout()
-        # btn_import = QPushButton("Importar templates (JSON)…")
-        # btn_import.clicked.connect(self.import_templates_json)
-        # btn_export = QPushButton("Exportar templates (JSON)…")
-        # btn_export.clicked.connect(self.export_templates_json)
-        # btn_adhoc = QPushButton("Aplicar hierarquia ad-hoc na aba ativa…")
-        # btn_adhoc.clicked.connect(self.apply_template_adhoc_dialog)
-        # h3.addWidget(btn_import)
-        # h3.addWidget(btn_export)
         h3.addStretch(1)
-        # h3.addWidget(btn_adhoc)
         lay.addLayout(h3)
 
         return g
@@ -951,14 +937,10 @@ class HierarchyTab(QWidget):
             it.setIcon(0, icon)
         except Exception:
             pass
-        # 👇 força o triângulo/expander a aparecer mesmo quando selecionado ou antes do lazy-load
         if is_dir:
             it.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
-
         it.setData(0, Qt.UserRole, id(page))
         return it
-
-
 
     def _ensure_buttons(self, page: '_Page', item: QTreeWidgetItem):
         from PySide6.QtWidgets import QMenu, QWidget, QHBoxLayout
@@ -971,7 +953,7 @@ class HierarchyTab(QWidget):
         b_plus = QPushButton("+")
         b_plus.setFixedWidth(24)
         b_plus.clicked.connect(lambda: self.add_child(item))
-        b_plus.setVisible(is_dir)  # <-- só aparece para pastas
+        b_plus.setVisible(is_dir)
 
         b_more = QPushButton("⋯")
         b_more.setFixedWidth(24)
@@ -981,7 +963,7 @@ class HierarchyTab(QWidget):
 
             act_sib = menu.addAction("+ Irmão")
             act_child = menu.addAction("+ Filho")
-            act_child.setEnabled(is_dir)  # arquivo não pode ter filho
+            act_child.setEnabled(is_dir)
             act_rename = menu.addAction("Renomear")
             act_rename_replace = menu.addAction("Renomear (replace…)")
 
@@ -991,10 +973,9 @@ class HierarchyTab(QWidget):
 
             act_del = menu.addAction("Remover")
 
-            # Abre ANCORADO no botão "⋯"
             chosen = menu.exec(b_more.mapToGlobal(QPoint(0, b_more.height())))
             if not chosen:
-                return  # clicou fora → fecha e não reabre
+                return
 
             if chosen == act_sib:
                 self.add_sibling(item)
@@ -1009,7 +990,7 @@ class HierarchyTab(QWidget):
                 targets = pg.tree.selectedItems() or [item]
                 old_names_preview = targets[0].text(0) if targets else ""
                 dlg = ReplaceDialog(self, current_name=old_names_preview)
-                dlg.exec()  # menu já está fechado; só executa o diálogo
+                dlg.exec()
             elif chosen == act_sel_one:
                 pg = self._page_of_item(item)
                 pg.tree.clearSelection()
@@ -1017,16 +998,12 @@ class HierarchyTab(QWidget):
             elif chosen == act_sel_children:
                 pg = self._page_of_item(item)
                 pg.tree.clearSelection()
-
-                # Seleciona recursivamente TODAS as descendentes (todos os níveis)
                 def _select_recursive(node: QTreeWidgetItem):
                     for i in range(node.childCount()):
                         ch = node.child(i)
                         ch.setSelected(True)
                         _select_recursive(ch)
-
                 _select_recursive(item)
-
                 if item.childCount() == 0:
                     item.setSelected(True)
             elif chosen == act_sel_siblings:
@@ -1037,48 +1014,19 @@ class HierarchyTab(QWidget):
             elif chosen == act_del:
                 self.remove_item(item)
 
-
         b_more.clicked.connect(persistent_menu)
-
         h.addWidget(b_plus)
         h.addWidget(b_more)
         h.addStretch(1)
         page.tree.setItemWidget(item, 1, w)
 
-
     def _page_of_item(self, it: QTreeWidgetItem) -> '_Page':
-        # Encontrar a página a partir do item (via UserRole)
         for idx in range(self.tabs.count()):
             pg = self.tabs.widget(idx)
             if isinstance(pg, HierarchyTab._Page):
-                # confere se item pertence à tree desta página
                 if it.treeWidget() is pg.tree:
                     return pg
-        # fallback: página atual
         return self._cur_page()
-
-    def _find_child_by_name(self, parent_item: QTreeWidgetItem, name: str) -> Optional[QTreeWidgetItem]:
-        for i in range(parent_item.childCount()):
-            if parent_item.child(i).text(0) == name:
-                return parent_item.child(i)
-        return None
-
-    def _ensure_path_under(self, parent_item: QTreeWidgetItem, parts: List[str]) -> QTreeWidgetItem:
-        current = parent_item
-        pg = self._page_of_item(parent_item)
-        for part in parts:
-            s = part.strip()
-            if not s:
-                continue
-            existing = self._find_child_by_name(current, s)
-            if existing is None:
-                new_item = self._make_item(pg, s, is_dir=True)
-                current.addChild(new_item)
-                self._ensure_buttons(pg, new_item)
-                current = new_item
-            else:
-                current = existing
-        return current
 
     def _iter_siblings(self, it: QTreeWidgetItem):
         parent = it.parent()
@@ -1094,93 +1042,7 @@ class HierarchyTab(QWidget):
                 if sib is not it:
                     yield sib
 
-    def _iter_descendants(self, it: QTreeWidgetItem):
-        stack = [it]
-        for i in range(it.childCount()):
-            stack.append(it.child(i))
-        while stack:
-            cur = stack.pop()
-            if cur is not it:
-                yield cur
-            for j in range(cur.childCount()):
-                stack.append(cur.child(j))
-
-    def _iter_all_items(self, page: Optional['_Page'] = None) -> List[QTreeWidgetItem]:
-        pg = page or self._cur_page()
-        if not pg:
-            return []
-        result: List[QTreeWidgetItem] = []
-        def walk(node: QTreeWidgetItem):
-            result.append(node)
-            for i in range(node.childCount()):
-                walk(node.child(i))
-        for i in range(pg.tree.topLevelItemCount()):
-            walk(pg.tree.topLevelItem(i))
-        return result
-
-    # -------------- Operações de seleção e rename --------------
-    def _replace_in_items(self, page: '_Page', items: List[QTreeWidgetItem], find_txt: str, repl_txt: str, only_first: bool = False) -> int:
-        changed = 0
-        if not find_txt:
-            return 0
-        for it in items:
-            old = it.text(0)
-            new = old.replace(find_txt, repl_txt, 1) if only_first else old.replace(find_txt, repl_txt)
-            if new != old and new.strip():
-                it.setText(0, new)
-                changed += 1
-        return changed
-
-    def _mark(self, it: QTreeWidgetItem):
-        it.setSelected(True)
-
-    def _clear_selection(self):
-        pg = self._cur_page()
-        if pg:
-            pg.tree.clearSelection()
-
-    # -------------- Modo marcar múltiplos (API preservada) --------------
-    def _set_checkable_for_all(self, enable: bool):
-        pg = self._cur_page()
-        if not pg:
-            return
-        for it in self._iter_all_items(pg):
-            flags = it.flags()
-            if enable:
-                it.setFlags(flags | Qt.ItemIsUserCheckable)
-                it.setCheckState(0, Qt.Unchecked)
-            else:
-                it.setFlags(flags & ~Qt.ItemIsUserCheckable)
-                it.setCheckState(0, Qt.Unchecked)
-
-    def toggle_multi_mark_mode(self, enabled: bool):
-        self.multi_mark_mode = enabled
-        self._set_checkable_for_all(enabled)
-        # Se esses botões existirem no seu layout, atualiza o estado;
-        # mantido apenas para compatibilidade com chamadas externas.
-        if hasattr(self, "btn_clear_checks"):
-            self.btn_clear_checks.setEnabled(enabled)
-        if hasattr(self, "btn_multi"):
-            self.btn_multi.setText("Sair do modo marcar" if enabled else "Marcar vários")
-
-    def clear_all_checks(self):
-        if not self.multi_mark_mode:
-            return
-        pg = self._cur_page()
-        if not pg:
-            return
-        for it in self._iter_all_items(pg):
-            if it.flags() & Qt.ItemIsUserCheckable:
-                it.setCheckState(0, Qt.Unchecked)
-
-    def iter_checked_items(self) -> List[QTreeWidgetItem]:
-        pg = self._cur_page()
-        if not pg:
-            return []
-        return [it for it in self._iter_all_items(pg)
-                if (it.flags() & Qt.ItemIsUserCheckable) and it.checkState(0) == Qt.Checked]
-
-    # -------------- Ações da ÁRVORE (sempre na aba ativa) --------------
+    # -------------- Ações da ÁRVORE --------------
     def add_root(self):
         pg = self._cur_page()
         if not pg:
@@ -1199,18 +1061,14 @@ class HierarchyTab(QWidget):
             if not sel:
                 return
             ref = sel[0]
-
-        # <-- impede filho em arquivo
         if not bool(ref.data(0, self.ROLE_IS_DIR)):
             QMessageBox.information(self, "Item é arquivo", "Arquivos não podem ter filhos. Selecione uma pasta.")
             return
-
         child = self._make_item(pg, "subpasta", is_dir=True)
         ref.addChild(child)
         self._ensure_buttons(pg, child)
         pg.tree.expandItem(ref)
         pg.tree.edit(pg.tree.indexFromItem(child, 0))
-
 
     def add_sibling(self, ref: Optional[QTreeWidgetItem] = None):
         pg = self._cur_page()
@@ -1246,7 +1104,30 @@ class HierarchyTab(QWidget):
         else:
             pg.tree.takeTopLevelItem(idx)
 
-    # -------------- Serialização & criação no disco (aba ativa) --------------
+    # -------------- Serialização & criação no disco --------------
+    def _ensure_path_under(self, parent_item: QTreeWidgetItem, parts: List[str]) -> QTreeWidgetItem:
+        current = parent_item
+        pg = self._page_of_item(parent_item)
+        for part in parts:
+            s = part.strip()
+            if not s:
+                continue
+            existing = self._find_child_by_name(current, s)
+            if existing is None:
+                new_item = self._make_item(pg, s, is_dir=True)
+                current.addChild(new_item)
+                self._ensure_buttons(pg, new_item)
+                current = new_item
+            else:
+                current = existing
+        return current
+
+    def _find_child_by_name(self, parent_item: QTreeWidgetItem, name: str) -> Optional[QTreeWidgetItem]:
+        for i in range(parent_item.childCount()):
+            if parent_item.child(i).text(0) == name:
+                return parent_item.child(i)
+        return None
+
     def _collect_paths(self) -> List[List[str]]:
         pg = self._cur_page()
         if not pg:
@@ -1339,17 +1220,6 @@ class HierarchyTab(QWidget):
         except Exception:
             pass
 
-    def _parse_template_lines(self, text: str) -> List[List[str]]:
-        paths: List[List[str]] = []
-        for raw in text.splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = [p.strip() for p in line.split("/") if p.strip()]
-            if parts:
-                paths.append(parts)
-        return paths
-
     def apply_selected_template_to_selected_parents(self):
         name = self.cb_templates.currentText()
         if not name or name not in self.templates:
@@ -1367,131 +1237,721 @@ class HierarchyTab(QWidget):
                 self._ensure_path_under(parent, parts)
             pg.tree.expandItem(parent)
 
-    def apply_template_adhoc_dialog(self):
-        pg = self._cur_page()
-        if not pg:
-            return
-        example = "3k/jpg\n3k/png\n4k/jpg\n4k/png"
-        text, ok = QInputDialog.getMultiLineText(
-            self, "Aplicar hierarquia ad-hoc (aba ativa)",
-            "Cole a hierarquia (uma linha por caminho; use '/' para níveis):",
-            example
-        )
-        if not ok:
-            return
-        path_specs = self._parse_template_lines(text)
-        if not path_specs:
-            QMessageBox.information(self, "Aplicar hierarquia", "Nenhum caminho válido informado.")
-            return
-        sel = pg.tree.selectedItems()
-        if not sel:
-            QMessageBox.information(self, "Aplicar hierarquia", "Selecione um ou mais pais na árvore da aba ativa.")
-            return
-        for parent in sel:
-            for parts in path_specs:
-                self._ensure_path_under(parent, parts)
-            pg.tree.expandItem(parent)
+class _FilterRow(QWidget):
+    TYPES = ["resolução (maior lado)", "extensão", "perfil de cor"]
 
-    def create_template_dialog(self):
-        name, ok = QInputDialog.getText(self, "Novo template", "Nome do template:")
-        if not ok or not name.strip():
-            return
-        name = name.strip()
-        if name in self.templates:
-            QMessageBox.warning(self, "Template", "Já existe um template com esse nome.")
-            return
-        example = "3k/jpg\n3k/png\n4k/jpg\n4k/png"
-        text, ok2 = QInputDialog.getMultiLineText(
-            self, "Novo template", "Digite a hierarquia (uma linha por caminho; use '/' para níveis):", example
-        )
-        if not ok2:
-            return
-        paths = self._parse_template_lines(text)
-        if not paths:
-            QMessageBox.information(self, "Template", "Nenhum caminho válido informado.")
-            return
-        self.templates[name] = paths
-        self._refresh_templates_combo(select_name=name)
-        self._save_templates_to_disk()
-        QMessageBox.information(self, "Template", "Template criado e salvo.")
+    def __init__(self, parent=None, initial_type="extensão", initial_values=""):
+        super().__init__(parent)
 
-    def edit_current_template_dialog(self):
-        name = self.cb_templates.currentText()
-        if not name or name not in self.templates:
-            QMessageBox.information(self, "Editar template", "Selecione um template.")
-            return
-        current_lines = "\n".join("/".join(p) for p in self.templates[name])
-        new_text, ok = QInputDialog.getMultiLineText(
-            self, f"Editar template: {name}",
-            "Edite a hierarquia (uma linha por caminho; use '/' para níveis):",
-            current_lines
-        )
-        if not ok:
-            return
-        new_paths = self._parse_template_lines(new_text)
-        if not new_paths:
-            QMessageBox.information(self, "Editar template", "Nenhum caminho válido informado.")
-            return
-        self.templates[name] = new_paths
-        self._save_templates_to_disk()
-        QMessageBox.information(self, "Editar template", "Template atualizado e salvo.")
+        # Layout em grade: [tipo][valores][remover]
+        g = QGridLayout(self)
+        g.setContentsMargins(0, 0, 0, 0)
+        g.setHorizontalSpacing(6)
+        g.setVerticalSpacing(4)
 
-    def delete_current_template(self):
-        name = self.cb_templates.currentText()
-        if not name or name not in self.templates:
-            return
-        if QMessageBox.question(self, "Remover template", f"Remover '{name}'?") == QMessageBox.Yes:
-            del self.templates[name]
-            self._refresh_templates_combo()
-            self._save_templates_to_disk()
-            QMessageBox.information(self, "Template", "Template removido.")
+        self.type_cb = QComboBox()
+        self.type_cb.addItems(self.TYPES)
+        if initial_type in self.TYPES:
+            self.type_cb.setCurrentText(initial_type)
+        self.type_cb.setMinimumContentsLength(14)
+        self.type_cb.setFixedHeight(28)
 
-    def import_templates_json(self):
-        fn, _ = QFileDialog.getOpenFileName(self, "Importar templates (JSON)", filter="JSON (*.json)")
-        if not fn:
+        self.values_edit = QLineEdit()
+        self.values_edit.setPlaceholderText("valores separados por vírgula")
+        self.values_edit.setFixedHeight(28)
+
+        # Botão remover “fininho”
+        self.btn_remove = QToolButton()
+        self.btn_remove.setText("−")
+        self.btn_remove.setToolTip("Remover filtro")
+        self.btn_remove.setAutoRaise(True)
+        self.btn_remove.setFixedSize(22, 22)
+
+        # Estilos compactos (menos padding)
+        self.type_cb.setStyleSheet("QComboBox{padding:2px 6px;}")
+        self.values_edit.setStyleSheet("QLineEdit{padding:2px 6px;}")
+        self.btn_remove.setStyleSheet("QToolButton{padding:0px;}")
+
+        g.addWidget(self.type_cb,    0, 0)
+        g.addWidget(self.values_edit,0, 1)
+        g.addWidget(self.btn_remove, 0, 2)
+
+        # estica a coluna dos valores
+        g.setColumnStretch(0, 0)
+        g.setColumnStretch(1, 1)
+        g.setColumnStretch(2, 0)
+
+    def spec(self) -> Tuple[str, List[str]]:
+        ftype = self.type_cb.currentText().strip().lower()
+        raw = self.values_edit.text()
+        vals = [v.strip() for v in raw.split(",") if v.strip()]
+        return ftype, vals
+
+
+class PeneratorDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("File Penerator — Filtros")
+
+        # layout principal mais “justo”
+        v = QVBoxLayout(self)
+        v.setContentsMargins(10, 10, 10, 10)
+        v.setSpacing(8)
+
+        # Container de linhas com margens mínimas
+        rows_wrap = QWidget(self)
+        self.rows_box = QVBoxLayout(rows_wrap)
+        self.rows_box.setContentsMargins(0, 0, 0, 0)
+        self.rows_box.setSpacing(6)
+
+        # linhas padrão
+        self._add_row("extensão", "jpg,png")
+        self._add_row("resolução (maior lado)", "")
+
+        # barra de adicionar mais filtros (compacta)
+        add_bar = QHBoxLayout()
+        add_bar.setContentsMargins(0, 0, 0, 0)
+        add_bar.setSpacing(6)
+
+        self.btn_add = QPushButton("+ adicionar filtro")
+        self.btn_add.setFixedHeight(26)
+        self.btn_add.clicked.connect(lambda: self._add_row())
+
+        add_bar.addWidget(self.btn_add)
+        add_bar.addStretch(1)
+
+        # rodapé de opções (compacto)
+        self.cb_replicate = QCheckBox("Após mover, perguntar onde replicar somente a estrutura")
+        self.cb_concat_suffix = QCheckBox("Concatenar rótulos dos filtros ao nome do arquivo (exceto extensão)")
+        for cb in (self.cb_replicate, self.cb_concat_suffix):
+            cb.setStyleSheet("QCheckBox{spacing:6px;}")
+
+        # botões OK/Cancel pequenos
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        for b in btns.buttons():
+            b.setFixedHeight(26)
+
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+
+        # monta
+        v.addWidget(rows_wrap)
+        v.addLayout(add_bar)
+        v.addWidget(self.cb_replicate)
+        v.addWidget(self.cb_concat_suffix)
+        v.addWidget(btns)
+
+        _center_dialog(self, parent)
+
+    def _add_row(self, initial_type="extensão", initial_values=""):
+        row = _FilterRow(self, initial_type, initial_values)
+        self.rows_box.addWidget(row)
+        row.btn_remove.clicked.connect(lambda: self._remove_row(row))
+
+    def _remove_row(self, row: _FilterRow):
+        row.setParent(None)
+        row.deleteLater()
+
+    def chosen(self) -> Tuple[List[Tuple[str, List[str]]], bool, bool]:
+        filters: List[Tuple[str, List[str]]] = []
+        for i in range(self.rows_box.count()):
+            w = self.rows_box.itemAt(i).widget()
+            if isinstance(w, _FilterRow):
+                t, vals = w.spec()
+                if vals:
+                    filters.append((t, vals))
+        return filters, self.cb_replicate.isChecked(), self.cb_concat_suffix.isChecked()
+
+
+class PeneratorTab(QWidget):
+    """
+    - Mostra FS de origem com lazy-load.
+    - Botão 'Penerator' abre o diálogo de filtros dinâmicos (3 tipos).
+    - Executa pipeline de filtros em ORDEM -> cria hierarquia aninhada no destino.
+    - Atualiza a árvore da ORIGEM depois de mover.
+    - Opções: replicar só a estrutura e concatenar rótulos no nome (exceto extensão).
+    """
+    ROLE_FULLPATH = Qt.UserRole + 1
+    ROLE_HAS_SUBDIRS = Qt.UserRole + 2
+    ROLE_IS_DIR = Qt.UserRole + 3
+    DUMMY_MARK = "…"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._busy_timer: Optional[QTimer] = None
+        self._progress: Optional[QProgressDialog] = None
+        self._build_ui()
+
+    # ---------- Busy/UI helpers ----------
+    def _begin_busy(self, text: str = "Processando…"):
+        if self._busy_timer:
+            try: self._busy_timer.stop()
+            except Exception: pass
+            self._busy_timer = None
+
+        self._busy_timer = QTimer(self)
+        self._busy_timer.setSingleShot(True)
+
+        def _show():
+            if self._progress is None:
+                self._progress = QProgressDialog(text, None, 0, 0, self)
+                self._progress.setWindowTitle("Aguarde")
+                self._progress.setCancelButton(None)
+                self._progress.setWindowModality(Qt.ApplicationModal)
+                self._progress.setMinimumWidth(360)
+                self._progress.show()
+                _center_dialog(self._progress, self)
+                QApplication.processEvents()
+
+        self._busy_timer.timeout.connect(_show)
+        self._busy_timer.start(300)
+
+    def _end_busy(self):
+        if self._busy_timer:
+            try: self._busy_timer.stop()
+            except Exception: pass
+            self._busy_timer.deleteLater()
+            self._busy_timer = None
+        if self._progress:
+            try: self._progress.close()
+            except Exception: pass
+            self._progress.deleteLater()
+            self._progress = None
+
+    def _pump(self, i: int, every: int = 64):
+        if i % every == 0:
+            QApplication.processEvents()
+
+    # ---------- UI principal ----------
+    def _build_ui(self):
+        v = QVBoxLayout(self)
+
+        # Header
+        h = QHBoxLayout()
+        self.base_edit = QLineEdit()
+        self.base_edit.setPlaceholderText("Pasta de origem para penerator…")
+
+        btn_open = QPushButton("Abrir pasta…")
+        btn_open.clicked.connect(self._choose_and_open)
+
+        btn_refresh = QPushButton("Atualizar")
+        btn_refresh.clicked.connect(self._refresh_current_view)
+
+        self.btn_penerator = QPushButton("Penerator")
+        self.btn_penerator.setEnabled(False)
+        self.btn_penerator.clicked.connect(self._run_penerator)
+
+        h.addWidget(btn_open)
+        h.addWidget(self.base_edit)
+        h.addWidget(btn_refresh)
+        h.addWidget(self.btn_penerator)
+        v.addLayout(h)
+
+        # Árvore com lazy-load
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(2)
+        self.tree.setHeaderLabels(["Item", "Ações"])
+        self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.tree.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
+        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.tree.setAnimated(True)
+        self.tree.itemExpanded.connect(self._on_item_expanded)
+        self.tree.itemCollapsed.connect(self._on_item_collapsed)
+        v.addWidget(self.tree)
+
+        # Clique no triângulo do expander mais amigável
+        self.tree.viewport().installEventFilter(self)
+
+    # ---------- Event filter (expander amigável) ----------
+    def eventFilter(self, obj, ev):
+        if obj is self.tree.viewport() and ev.type() == QEvent.MouseButtonPress:
+            pos = ev.position().toPoint() if hasattr(ev, "position") else ev.pos()
+            idx = self.tree.indexAt(pos)
+            if idx.isValid():
+                row_rect = self.tree.visualRect(idx)
+                depth = 0
+                p = idx.parent()
+                while p.isValid():
+                    depth += 1
+                    p = p.parent()
+                x0 = row_rect.left() + depth * self.tree.indentation()
+                indicator_width = 18
+                indicator_rect = QRect(x0, row_rect.top(), indicator_width, row_rect.height())
+                if indicator_rect.contains(pos):
+                    self.tree.setExpanded(idx, not self.tree.isExpanded(idx))
+                    return True
+        return super().eventFilter(obj, ev)
+
+    # ---------- FS / Lazy-load ----------
+    def _choose_and_open(self):
+        base = _choose_directory(self, "Escolher pasta de origem")
+        if not base:
             return
+        self.base_edit.setText(base)
+        self._load_root(base)
+        self.btn_penerator.setEnabled(True)
+
+    def _refresh_current_view(self):
+        base = self.base_edit.text().strip()
+        if base:
+            self._load_root(base)
+
+    def _load_root(self, base_dir: str):
         try:
-            data = json.loads(Path(fn).read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                raise ValueError("Estrutura JSON inválida (esperado objeto).")
-            count = 0
-            for k, v in data.items():
-                if isinstance(k, str) and isinstance(v, list) and all(isinstance(p, list) for p in v):
-                    self.templates[k] = [[str(x) for x in p] for p in v]
-                    count += 1
-            self._refresh_templates_combo()
-            self._save_templates_to_disk()
-            QMessageBox.information(self, "Importar templates", f"Importados {count} templates (salvos).")
+            self.tree.clear()
+            p = Path(base_dir)
+            if not p.exists() or not p.is_dir():
+                raise FileNotFoundError("Pasta inválida")
+            root = self._make_dir_item(p.name, str(p))
+            self.tree.addTopLevelItem(root)
+            self._ensure_buttons(root)
+            root.addChild(QTreeWidgetItem([self.DUMMY_MARK, ""]))
+            self.tree.expandItem(root)
         except Exception as e:
-            QMessageBox.critical(self, "Importar templates", f"Falha: {e}")
+            QMessageBox.critical(self, "Erro", f"Falha ao abrir: {e}")
 
-    def export_templates_json(self):
-        if not self.templates:
-            QMessageBox.information(self, "Exportar templates", "Não há templates para exportar.")
-            return
-        fn, _ = QFileDialog.getSaveFileName(self, "Exportar templates (JSON)", filter="JSON (*.json)")
-        if not fn:
-            return
+    def _make_item(self, name: str, is_dir: bool) -> QTreeWidgetItem:
+        it = QTreeWidgetItem([name, ""])
+        it.setFlags(it.flags() | Qt.ItemIsEditable | Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+        it.setData(0, self.ROLE_IS_DIR, 1 if is_dir else 0)
+        if is_dir:
+            it.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
         try:
-            Path(fn).write_text(json.dumps(self.templates, ensure_ascii=False, indent=2), encoding="utf-8")
-            QMessageBox.information(self, "Exportar templates", "Exportado com sucesso.")
-        except Exception as e:
-            QMessageBox.critical(self, "Exportar templates", f"Falha: {e}")
+            icon = QApplication.style().standardIcon(QStyle.SP_DirIcon if is_dir else QStyle.SP_FileIcon)
+            it.setIcon(0, icon)
+        except Exception:
+            pass
+        return it
+
+    def _make_dir_item(self, name: str, full_path: str) -> QTreeWidgetItem:
+        it = self._make_item(name, True)
+        it.setData(0, self.ROLE_FULLPATH, full_path)
+        return it
+
+    def _make_file_item(self, name: str, full_path: str) -> QTreeWidgetItem:
+        it = self._make_item(name, False)
+        it.setData(0, self.ROLE_FULLPATH, full_path)
+        return it
+
+    def _load_children(self, parent_item: QTreeWidgetItem, parent_path: str):
+        try:
+            with os.scandir(parent_path) as it:
+                dirs, files = [], []
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=True):
+                            dirs.append(e)
+                        elif e.is_file(follow_symlinks=True):
+                            files.append(e)
+                    except Exception:
+                        continue
+            dirs.sort(key=lambda e: e.name.lower())
+            files.sort(key=lambda e: e.name.lower())
+
+            for i, d in enumerate(dirs, 1):
+                ch = self._make_dir_item(d.name, d.path)
+                parent_item.addChild(ch)
+                self._ensure_buttons(ch)
+                ch.addChild(QTreeWidgetItem([self.DUMMY_MARK, ""]))
+                self._pump(i)
+
+            for i, f in enumerate(files, 1):
+                ch = self._make_file_item(f.name, f.path)
+                parent_item.addChild(ch)
+                self._ensure_buttons(ch)
+                self._pump(i)
+
+            parent_item.setData(0, self.ROLE_HAS_SUBDIRS, 1 if dirs else 0)
+        except Exception:
+            parent_item.setData(0, self.ROLE_HAS_SUBDIRS, 0)
+
+    def _on_item_expanded(self, it: QTreeWidgetItem):
+        if it.childCount() == 1 and it.child(0).text(0) == self.DUMMY_MARK:
+            it.takeChildren()
+            base = it.data(0, self.ROLE_FULLPATH)
+            if not base:
+                return
+            self._begin_busy(f"Lendo “{Path(base).name}”…")
+            try:
+                self._load_children(it, str(base))
+            finally:
+                self._end_busy()
+
+    def _on_item_collapsed(self, it: QTreeWidgetItem):
+        it.takeChildren()
+        if bool(it.data(0, self.ROLE_HAS_SUBDIRS)):
+            it.addChild(QTreeWidgetItem([self.DUMMY_MARK, ""]))
+
+    # ---------- Botões/Ações por item ----------
+    def _ensure_buttons(self, item: QTreeWidgetItem):
+        from PySide6.QtWidgets import QMenu, QWidget, QHBoxLayout
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+
+        is_dir = bool(item.data(0, self.ROLE_IS_DIR))
+
+        b_plus = QPushButton("+")
+        b_plus.setFixedWidth(24)
+        b_plus.clicked.connect(lambda: self.add_child(item))
+        b_plus.setVisible(is_dir)
+
+        b_more = QPushButton("⋯")
+        b_more.setFixedWidth(24)
+
+        def persistent_menu():
+            menu = QMenu(self)
+            act_sib = menu.addAction("+ Irmão")
+            act_child = menu.addAction("+ Filho")
+            act_child.setEnabled(is_dir)
+            act_rename = menu.addAction("Renomear")
+            act_del = menu.addAction("Remover (da árvore)")
+
+            chosen = menu.exec(b_more.mapToGlobal(QPoint(0, b_more.height())))
+            if not chosen:
+                return
+            if chosen == act_sib:
+                self.add_sibling(item)
+            elif chosen == act_child and is_dir:
+                self.add_child(item)
+            elif chosen == act_rename:
+                idx = self.tree.indexFromItem(item, 0)
+                self.tree.edit(idx)
+            elif chosen == act_del:
+                self.remove_item(item)
+
+        b_more.clicked.connect(persistent_menu)
+
+        h.addWidget(b_plus)
+        h.addWidget(b_more)
+        h.addStretch(1)
+        self.tree.setItemWidget(item, 1, w)
+
+    def add_child(self, ref: Optional[QTreeWidgetItem] = None):
+        if ref is None:
+            sel = self.tree.selectedItems()
+            if not sel:
+                return
+            ref = sel[0]
+        if not bool(ref.data(0, self.ROLE_IS_DIR)):
+            QMessageBox.information(self, "Item é arquivo", "Arquivos não podem ter filhos. Selecione uma pasta.")
+            return
+        child = self._make_item("subpasta", True)
+        ref.addChild(child)
+        self._ensure_buttons(child)
+        self.tree.expandItem(ref)
+        self.tree.edit(self.tree.indexFromItem(child, 0))
+
+    def add_sibling(self, ref: Optional[QTreeWidgetItem] = None):
+        if ref is None:
+            sel = self.tree.selectedItems()
+            if not sel:
+                return
+            ref = sel[0]
+        parent = ref.parent()
+        sib = self._make_item("nova_pasta", True)
+        if parent is None:
+            self.tree.addTopLevelItem(sib)
+        else:
+            parent.addChild(sib)
+        self._ensure_buttons(sib)
+        self.tree.edit(self.tree.indexFromItem(sib, 0))
+
+    def remove_item(self, it: QTreeWidgetItem):
+        parent = it.parent()
+        idx = (parent.indexOfChild(it) if parent else self.tree.indexOfTopLevelItem(it))
+        if parent:
+            parent.takeChild(idx)
+        else:
+            self.tree.takeTopLevelItem(idx)
+
+    # ---------- Utilidades de imagem ----------
+    @staticmethod
+    def _is_image(path: Path) -> bool:
+        return path.suffix.lower() in {
+            ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".heic", ".heif", ".avif", ".jxl"
+        }
+
+    @staticmethod
+    def _get_largest_side_and_icc(path: Path) -> Tuple[Optional[int], Optional[str]]:
+        """
+        Retorna (maior_lado:int|None, icc_name:str|None)
+        Usa extract_icc_name() (já definida no arquivo).
+        """
+        try:
+            with Image.open(str(path)) as im:
+                w, h = im.size
+                ml = max(w, h)
+                icc_name = extract_icc_name(im.info.get("icc_profile"))
+                return ml, icc_name
+        except Exception:
+            return None, None
+
+    def _scan_images(self, root: Path) -> Tuple[List[Path], Dict[Path, Tuple[Optional[int], Optional[str]]]]:
+        files: List[Path] = []
+        props: Dict[Path, Tuple[Optional[int], Optional[str]]] = {}
+        idx = 0
+        for dirpath, _, filenames in os.walk(root):
+            for name in filenames:
+                p = Path(dirpath) / name
+                if not self._is_image(p):
+                    continue
+                files.append(p)
+                props[p] = self._get_largest_side_and_icc(p)
+                idx += 1
+                self._pump(idx, every=128)
+        return files, props
+
+    @staticmethod
+    def _unique_target(dest_dir: Path, filename: str) -> Path:
+        base = dest_dir / filename
+        if not base.exists():
+            return base
+        stem = base.stem
+        suffix = base.suffix
+        i = 1
+        while True:
+            cand = dest_dir / f"{stem}_{i}{suffix}"
+            if not cand.exists():
+                return cand
+            i += 1
+
+    def _replicate_structure(self, source_root: Path, target_root: Path):
+        for dirpath, dirnames, _ in os.walk(source_root):
+            rel = Path(dirpath).relative_to(source_root)
+            tgt = target_root / rel
+            try:
+                tgt.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+
+    # ---------- Helpers de rótulo/sufixo ----------
+    @staticmethod
+    def _suffix_from_resolution_label(label: str) -> str:
+        """
+        Transforma '4000' -> '4k' se múltiplo de 1000; senão '4000px'.
+        """
+        try:
+            n = int(label)
+            return f"{n//1000}k" if n % 1000 == 0 else f"{n}px"
+        except Exception:
+            return label
+
+    @staticmethod
+    def _suffix_from_profile_label(label: str) -> str:
+        """
+        Normaliza perfil de cor para sufixo: minúsculas, sem espaços/símbolos.
+        Ex.: 'sRGB IEC61966-2.1' -> 'srgbiec6196621' (curto e seguro).
+        """
+        s = label.lower()
+        import re
+        s = re.sub(r"[^a-z0-9]+", "", s)
+        return s or "icc"
+
+    # ---------- Execução do Penerator ----------
+    def _run_penerator(self):
+        base = self.base_edit.text().strip()
+        if not base:
+            QMessageBox.information(self, "Penerator", "Escolha primeiro a pasta de origem.")
+            return
+        root = Path(base)
+        if not root.exists() or not root.is_dir():
+            QMessageBox.warning(self, "Penerator", "Pasta de origem inválida.")
+            return
+
+        # 1) Filtros dinâmicos
+        dlg = PeneratorDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        filters, ask_replicate, concat_suffix = dlg.chosen()
+        if not filters:
+            QMessageBox.information(self, "Penerator", "Adicione ao menos um filtro com valores.")
+            return
+
+        # 2) Escanear imagens
+        self._begin_busy("Escaneando imagens…")
+        try:
+            files, props = self._scan_images(root)
+        finally:
+            self._end_busy()
+        if not files:
+            QMessageBox.information(self, "Penerator", "Nenhuma imagem encontrada nesta pasta.")
+            return
+
+        # 3) Destino principal
+        dest = _choose_directory(self, "Escolher pasta DESTINO (hierarquia pelos filtros)")
+        if not dest:
+            return
+        dest_root = Path(dest)
+        dest_root.mkdir(parents=True, exist_ok=True)
+
+        # 4) Função de match por tipo
+        def match_and_label(p: Path, info: Tuple[Optional[int], Optional[str]], ftype: str, vals: List[str]) -> Optional[str]:
+            """
+            Se o arquivo p 'passa' no filtro (ftype, vals), retorna o rótulo (string) a ser usado
+            como nome de pasta/sufixo para esse nível. Caso contrário, None.
+            """
+            ftype = ftype.lower()
+            largest, icc_name = info
+
+            if ftype.startswith("resolução"):  # maior lado
+                try:
+                    targets = {int(v) for v in vals}
+                except Exception:
+                    return None
+                if largest is None:
+                    return None
+                return str(largest) if largest in targets else None
+
+            if ftype == "extensão":
+                ext = p.suffix.lower().lstrip(".")
+                wanted = {v.lower().lstrip(".") for v in vals}
+                return ext if ext in wanted else None
+
+            if ftype.startswith("perfil"):  # perfil de cor
+                if not icc_name:
+                    return None
+                icc_lower = icc_name.lower()
+                for v in vals:
+                    if v.lower() in icc_lower:
+                        # usamos o próprio valor digitado como rótulo (para previsibilidade na hierarquia)
+                        return v
+                return None
+
+            return None  # tipo desconhecido (não deveria ocorrer)
+
+        # 5) Aplicar pipeline (ordem = profundidade da hierarquia)
+        moved = 0
+        skipped = 0
+
+        self._begin_busy("Organizando arquivos conforme filtros…")
+        try:
+            for i, p in enumerate(files, 1):
+                info = props.get(p, (None, None))
+                labels: List[str] = []
+                ok = True
+                for ftype, vals in filters:
+                    lab = match_and_label(p, info, ftype, vals)
+                    if lab is None:
+                        ok = False
+                        break
+                    labels.append(lab)
+
+                if not ok:
+                    skipped += 1
+                    self._pump(i, every=64)
+                    continue
+
+                # monta destino aninhado
+                cur_dir = dest_root
+                for lab in labels:
+                    safe = lab.replace("/", "-")
+                    cur_dir = cur_dir / safe
+                try:
+                    cur_dir.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+
+                # nome do arquivo (concatenado opcional)
+                orig_stem = p.stem
+                orig_suffix = p.suffix  # inclui o ponto
+
+                new_stem = orig_stem
+                if concat_suffix:
+                    # Para cada filtro NÃO-EXTENSÃO, derivar um sufixo curto
+                    suffix_tokens: List[str] = []
+                    for (ftype, _vals), lab in zip(filters, labels):
+                        ftype = ftype.lower()
+                        if ftype == "extensão":
+                            continue  # nunca concatenar extensão
+                        if ftype.startswith("resolução"):
+                            suffix_tokens.append(self._suffix_from_resolution_label(lab))
+                        elif ftype.startswith("perfil"):
+                            suffix_tokens.append(self._suffix_from_profile_label(lab))
+                    if suffix_tokens:
+                        new_stem = f"{orig_stem}_{'_'.join(suffix_tokens)}"
+
+                target_name = f"{new_stem}{orig_suffix}"
+                target = self._unique_target(cur_dir, target_name)
+
+                try:
+                    shutil.move(str(p), str(target))
+                    moved += 1
+                except Exception:
+                    skipped += 1
+
+                self._pump(i, every=32)
+        finally:
+            self._end_busy()
+
+        QMessageBox.information(
+            self,
+            "Penerator",
+            f"Arquivos movidos: {moved}\nIgnorados (não passaram nos filtros ou falha): {skipped}"
+        )
+
+        # 6) Atualiza a árvore da ORIGEM
+        self._refresh_current_view()
+
+        # 7) Replicar estrutura (opcional)
+        if moved and ask_replicate:
+            apply_dir = _choose_directory(self, "Aplicar (replicar) SOMENTE a ESTRUTURA em…")
+            if apply_dir:
+                try:
+                    self._begin_busy("Replicando estrutura…")
+                    self._replicate_structure(dest_root, Path(apply_dir))
+                finally:
+                    self._end_busy()
+                QMessageBox.information(self, "Penerator", "Estrutura replicada com sucesso.")
+
+def _choose_open_file(parent, title="Abrir arquivo", name_filter=""):
+    dlg = QFileDialog(parent, title)
+    dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+    if name_filter:
+        dlg.setNameFilter(name_filter)
+    dlg.setFileMode(QFileDialog.ExistingFile)
+    if dlg.exec() == QDialog.Accepted:
+        files = dlg.selectedFiles()
+        return (files[0], name_filter) if files else ("", name_filter)
+    return ("", name_filter)
+
+def _choose_save_file(parent, title="Salvar como", name_filter=""):
+    dlg = QFileDialog(parent, title)
+    dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+    dlg.setAcceptMode(QFileDialog.AcceptSave)
+    if name_filter:
+        dlg.setNameFilter(name_filter)
+    if dlg.exec() == QDialog.Accepted:
+        files = dlg.selectedFiles()
+        return (files[0], name_filter) if files else ("", name_filter)
+    return ("", name_filter)
+
+def _choose_directory(parent, title="Escolher pasta"):
+    dlg = QFileDialog(parent, title)
+    dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+    dlg.setFileMode(QFileDialog.Directory)
+    dlg.setOption(QFileDialog.ShowDirsOnly, True)
+    if dlg.exec() == QDialog.Accepted:
+        files = dlg.selectedFiles()
+        return files[0] if files else ""
+    return ""
 
 
-# ======= Janela Principal =======
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Ultimate File Penerator")
-        self.resize(1100, 900)
+        self.resize(1200, 900)
 
         # Abas
         self.tabs = QTabWidget()
         self.tab_meta = QWidget()
         self.tab_hier = HierarchyTab()
+        self.tab_penerator = PeneratorTab()
         self.tabs.addTab(self.tab_meta, "Metadados")
         self.tabs.addTab(self.tab_hier, "Hierarquia")
+        self.tabs.addTab(self.tab_penerator, "File Penerator")
         self.setCentralWidget(self.tabs)
 
         # --- Menu ---
@@ -1511,6 +1971,10 @@ class MainWindow(QMainWindow):
         act_hier = QAction("Criar Hierarquia de Pastas…", self)
         act_hier.triggered.connect(lambda: self.tabs.setCurrentWidget(self.tab_hier))
         m_ferr.addAction(act_hier)
+
+        act_pen = QAction("File Penerator", self)
+        act_pen.triggered.connect(lambda: self.tabs.setCurrentWidget(self.tab_penerator))
+        m_ferr.addAction(act_pen)
 
         # --- Conteúdo da aba Metadados ---
         v = QVBoxLayout(self.tab_meta)
@@ -1604,7 +2068,6 @@ class MainWindow(QMainWindow):
 
 
 def main():
-    import sys
     app = QApplication(sys.argv)
     install_dialog_normalizer(app, 500, 300)
     w = MainWindow()
