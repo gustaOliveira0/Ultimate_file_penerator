@@ -167,6 +167,9 @@ def _app_data_dir() -> Path:
 def _templates_json_path() -> Path:
     return _app_data_dir() / "templates.json"
 
+def _filter_templates_json_path() -> Path:
+    return _app_data_dir() / "filter_templates.json"
+
 
 def image_metadata_dict(img: Image.Image) -> Dict[str, Any]:
     width, height = img.size
@@ -1238,12 +1241,11 @@ class HierarchyTab(QWidget):
             pg.tree.expandItem(parent)
 
 class _FilterRow(QWidget):
-    TYPES = ["resolução (maior lado)", "extensão", "perfil de cor"]
+    TYPES = ["Resolução (maior lado)", "Extensão", "Perfil de cor", "Data"]
 
     def __init__(self, parent=None, initial_type="extensão", initial_values=""):
         super().__init__(parent)
 
-        # Layout em grade: [tipo][valores][remover]
         g = QGridLayout(self)
         g.setContentsMargins(0, 0, 0, 0)
         g.setHorizontalSpacing(6)
@@ -1251,23 +1253,29 @@ class _FilterRow(QWidget):
 
         self.type_cb = QComboBox()
         self.type_cb.addItems(self.TYPES)
-        if initial_type in self.TYPES:
-            self.type_cb.setCurrentText(initial_type)
         self.type_cb.setMinimumContentsLength(14)
         self.type_cb.setFixedHeight(28)
+
+        # 🔧 Seleção do tipo, tolerante a variações (minúsculas, prefixos)
+        wanted = (initial_type or "").strip().lower()
+        if wanted:
+            for t in self.TYPES:
+                if t.lower().startswith(wanted):
+                    self.type_cb.setCurrentText(t)
+                    break
 
         self.values_edit = QLineEdit()
         self.values_edit.setPlaceholderText("valores separados por vírgula")
         self.values_edit.setFixedHeight(28)
+        # 🔧 PREENCHE os valores iniciais vindos do template
+        self.values_edit.setText(initial_values)
 
-        # Botão remover “fininho”
         self.btn_remove = QToolButton()
         self.btn_remove.setText("−")
         self.btn_remove.setToolTip("Remover filtro")
         self.btn_remove.setAutoRaise(True)
         self.btn_remove.setFixedSize(22, 22)
 
-        # Estilos compactos (menos padding)
         self.type_cb.setStyleSheet("QComboBox{padding:2px 6px;}")
         self.values_edit.setStyleSheet("QLineEdit{padding:2px 6px;}")
         self.btn_remove.setStyleSheet("QToolButton{padding:0px;}")
@@ -1276,7 +1284,6 @@ class _FilterRow(QWidget):
         g.addWidget(self.values_edit,0, 1)
         g.addWidget(self.btn_remove, 0, 2)
 
-        # estica a coluna dos valores
         g.setColumnStretch(0, 0)
         g.setColumnStretch(1, 1)
         g.setColumnStretch(2, 0)
@@ -1289,12 +1296,196 @@ class _FilterRow(QWidget):
 
 
 class PeneratorDialog(QDialog):
+    def _normalize_type_label(self, label: str) -> str:
+        # Mapeia rótulos salvos (minúsculos, variações) para os oficiais do combo
+        for t in _FilterRow.TYPES:
+            if t.lower().startswith(label.strip().lower()):
+                return t
+        return _FilterRow.TYPES[0]
+
+    def _collect_current_filters(self) -> List[Tuple[str, List[str]]]:
+        specs: List[Tuple[str, List[str]]] = []
+        for i in range(self.rows_box.count()):
+            w = self.rows_box.itemAt(i).widget()
+            if isinstance(w, _FilterRow):
+                t, vals = w.spec()
+                if vals:
+                    specs.append((t, vals))
+        return specs
+
+    def _set_rows_from_spec(self, spec: List[Dict[str, Any]]):
+        # Limpa linhas atuais
+        while self.rows_box.count():
+            item = self.rows_box.takeAt(0)
+            w = item.widget()
+            if w:
+                w.setParent(None)
+                w.deleteLater()
+        # Reconstrói
+        for entry in spec:
+            t = self._normalize_type_label(str(entry.get("type", "")))
+            vals = ",".join(entry.get("values", []))
+            self._add_row(t, vals)
+        if self.rows_box.count() == 0:
+            self._add_row("Extensão", "")
+            self._add_row("Resolução (maior lado)", "")
+
+    # -------- Persistência dos templates (JSON) --------
+    def _load_filter_templates(self):
+        self._filter_templates: Dict[str, List[Dict[str, Any]]] = {}
+        try:
+            fp = _filter_templates_json_path()
+            if fp.exists():
+                data = json.loads(fp.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    # normaliza para [{type:str, values:[...]}]
+                    fixed: Dict[str, List[Dict[str, Any]]] = {}
+                    for name, arr in data.items():
+                        if not isinstance(name, str) or not isinstance(arr, list):
+                            continue
+                        entries: List[Dict[str, Any]] = []
+                        for e in arr:
+                            if isinstance(e, dict):
+                                typ = str(e.get("type", "extensão"))
+                                vals = e.get("values", [])
+                                if isinstance(vals, list):
+                                    vals = [str(x) for x in vals]
+                                else:
+                                    vals = [str(vals)]
+                                entries.append({"type": typ, "values": vals})
+                            elif isinstance(e, (list, tuple)) and len(e) == 2:
+                                typ = str(e[0])
+                                vals = e[1] if isinstance(e[1], list) else [str(e[1])]
+                                entries.append({"type": typ, "values": [str(v) for v in vals]})
+                        if entries:
+                            fixed[name] = entries
+                    self._filter_templates = fixed
+        except Exception:
+            self._filter_templates = {}
+
+    def _save_filter_templates(self):
+        try:
+            fp = _filter_templates_json_path()
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_text(json.dumps(self._filter_templates, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _refresh_filter_templates_combo(self, select_name: Optional[str] = None):
+        self.cb_filter_templates.blockSignals(True)
+        cur = self.cb_filter_templates.currentText()
+        self.cb_filter_templates.clear()
+        names = sorted(self._filter_templates.keys())
+        self.cb_filter_templates.addItems(names)
+        if select_name and select_name in self._filter_templates:
+            self.cb_filter_templates.setCurrentText(select_name)
+        elif cur in self._filter_templates:
+            self.cb_filter_templates.setCurrentText(cur)
+        self.cb_filter_templates.blockSignals(False)
+
+    def _apply_selected_filter_template(self):
+        name = self.cb_filter_templates.currentText().strip()
+        if not name or name not in self._filter_templates:
+            QMessageBox.information(self, "Templates de filtros", "Selecione um template.")
+            return
+        self._set_rows_from_spec(self._filter_templates[name])
+
+    def _save_current_filters_as_template(self):
+        name, ok = QInputDialog.getText(self, "Salvar como template de filtros", "Nome do template:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if name in self._filter_templates:
+            if QMessageBox.question(self, "Sobrescrever?", f"Já existe '{name}'. Substituir?") != QMessageBox.Yes:
+                return
+        # coleta → normaliza para [{type, values}]
+        entries = []
+        for t, vals in self._collect_current_filters():
+            entries.append({"type": t, "values": vals})
+        if not entries:
+            QMessageBox.information(self, "Templates de filtros", "Não há filtros para salvar.")
+            return
+        self._filter_templates[name] = entries
+        self._save_filter_templates()
+        self._refresh_filter_templates_combo(select_name=name)
+        QMessageBox.information(self, "Templates de filtros", "Template salvo.")
+
+    def _edit_current_filter_template(self):
+        name = self.cb_filter_templates.currentText().strip()
+        if not name or name not in self._filter_templates:
+            QMessageBox.information(self, "Editar template", "Selecione um template.")
+            return
+        # Representação textual simples: "tipo: v1,v2"
+        lines = []
+        for e in self._filter_templates[name]:
+            lines.append(f"{e.get('type','')}: {','.join(e.get('values', []))}")
+        text_init = "\n".join(lines)
+        text, ok = QInputDialog.getMultiLineText(
+            self, f"Editar template: {name}",
+            "Um por linha (ex.: 'extensão: jpg,png'):\nTipos válidos: " + ", ".join(_FilterRow.TYPES),
+            text_init
+        )
+        if not ok:
+            return
+        # parse
+        new_entries: List[Dict[str, Any]] = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" in line:
+                t, vals = line.split(":", 1)
+                t = self._normalize_type_label(t.strip())
+                vals_list = [v.strip() for v in vals.split(",") if v.strip()]
+                if vals_list:
+                    new_entries.append({"type": t, "values": vals_list})
+        if not new_entries:
+            QMessageBox.information(self, "Editar template", "Nenhuma linha válida.")
+            return
+        self._filter_templates[name] = new_entries
+        self._save_filter_templates()
+        QMessageBox.information(self, "Templates de filtros", "Template atualizado e salvo.")
+
+    def _delete_current_filter_template(self):
+        name = self.cb_filter_templates.currentText().strip()
+        if not name or name not in self._filter_templates:
+            return
+        if QMessageBox.question(self, "Remover template", f"Remover '{name}'?") == QMessageBox.Yes:
+            del self._filter_templates[name]
+            self._save_filter_templates()
+            self._refresh_filter_templates_combo()
+            QMessageBox.information(self, "Templates de filtros", "Template removido.")
     def __init__(self, parent):
         super().__init__(parent)
         self.setWindowTitle("File Penerator — Filtros")
 
         # layout principal mais “justo”
         v = QVBoxLayout(self)
+        tpl_bar = QHBoxLayout()
+        tpl_bar.setContentsMargins(0, 0, 0, 0)
+        tpl_bar.setSpacing(6)
+
+        self.cb_filter_templates = QComboBox()
+        self.cb_filter_templates.setMinimumContentsLength(20)
+
+        btn_tpl_apply = QPushButton("Aplicar")
+        btn_tpl_save  = QPushButton("Salvar como…")
+        btn_tpl_edit  = QPushButton("Editar…")
+        btn_tpl_del   = QPushButton("Remover")
+
+        btn_tpl_apply.clicked.connect(self._apply_selected_filter_template)
+        btn_tpl_save.clicked.connect(self._save_current_filters_as_template)
+        btn_tpl_edit.clicked.connect(self._edit_current_filter_template)
+        btn_tpl_del.clicked.connect(self._delete_current_filter_template)
+
+        tpl_bar.addWidget(QLabel("Template:"))
+        tpl_bar.addWidget(self.cb_filter_templates, 1)
+        tpl_bar.addWidget(btn_tpl_apply)
+        tpl_bar.addWidget(btn_tpl_save)
+        tpl_bar.addWidget(btn_tpl_edit)
+        tpl_bar.addWidget(btn_tpl_del)
+
+        v.addLayout(tpl_bar)
         v.setContentsMargins(10, 10, 10, 10)
         v.setSpacing(8)
 
@@ -1322,7 +1513,7 @@ class PeneratorDialog(QDialog):
 
         # rodapé de opções (compacto)
         self.cb_replicate = QCheckBox("Após mover, perguntar onde replicar somente a estrutura")
-        self.cb_concat_suffix = QCheckBox("Concatenar rótulos dos filtros ao nome do arquivo (exceto extensão)")
+        self.cb_concat_suffix = QCheckBox("Concatenar filtros ao nome do arquivo")
         for cb in (self.cb_replicate, self.cb_concat_suffix):
             cb.setStyleSheet("QCheckBox{spacing:6px;}")
 
@@ -1340,7 +1531,8 @@ class PeneratorDialog(QDialog):
         v.addWidget(self.cb_replicate)
         v.addWidget(self.cb_concat_suffix)
         v.addWidget(btns)
-
+        self._load_filter_templates()
+        self._refresh_filter_templates_combo()
         _center_dialog(self, parent)
 
     def _add_row(self, initial_type="extensão", initial_values=""):
@@ -1674,23 +1866,94 @@ class PeneratorTab(QWidget):
         }
 
     @staticmethod
-    def _get_largest_side_and_icc(path: Path) -> Tuple[Optional[int], Optional[str]]:
+    def _normalize_exif_datetime(dt: Any) -> Optional[str]:
         """
-        Retorna (maior_lado:int|None, icc_name:str|None)
-        Usa extract_icc_name() (já definida no arquivo).
+        Converte strings comuns de data do EXIF/XMP para 'YYYY-MM-DD'.
+        Aceita:
+        - 'YYYY:MM:DD HH:MM:SS'
+        - 'YYYY-MM-DD' (com ou sem hora)
+        - ISO 8601 parcial: 'YYYY-MM-DDTHH:MM:SS[.mmm]Z' etc.
         """
+        try:
+            s = str(dt).strip()
+            if not s:
+                return None
+
+            # 1) EXIF clássico: 'YYYY:MM:DD HH:MM:SS'
+            if len(s) >= 10 and s[4] in (":", "-") and s[7] in (":", "-"):
+                y = s[0:4]
+                m = s[5:7]
+                d = s[8:10]
+                if y.isdigit() and m.isdigit() and d.isdigit():
+                    return f"{y}-{m}-{d}"
+
+            # 2) ISO/XMP: tentar por regex
+            import re
+            m = re.search(r"(\d{4})[-:](\d{2})[-:](\d{2})", s)
+            if m:
+                y, mo, d = m.group(1), m.group(2), m.group(3)
+                return f"{y}-{mo}-{d}"
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _get_largest_side_and_icc(path: Path) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+        """
+        Retorna (maior_lado:int|None, icc_name:str|None, exif_date:'YYYY-MM-DD'|None)
+        exif_date pode vir de: DateTimeOriginal, DateTimeDigitized, DateTime, ou XMP (CreateDate/ModifyDate).
+        """
+        exif_date = None
+        icc_name = None
+        largest = None
         try:
             with Image.open(str(path)) as im:
                 w, h = im.size
-                ml = max(w, h)
+                largest = max(w, h)
                 icc_name = extract_icc_name(im.info.get("icc_profile"))
-                return ml, icc_name
-        except Exception:
-            return None, None
 
-    def _scan_images(self, root: Path) -> Tuple[List[Path], Dict[Path, Tuple[Optional[int], Optional[str]]]]:
+                # --- EXIF ---
+                try:
+                    exif = im.getexif()
+                    if exif:
+                        from PIL.ExifTags import TAGS
+                        # Preferência: DateTimeOriginal (36867), depois Digitized (36868), depois DateTime (306)
+                        preferred = {"DateTimeOriginal", "DateTimeDigitized", "DateTime"}
+                        found: dict[str, Any] = {}
+                        for k, v in exif.items():
+                            tag = str(TAGS.get(k, k))
+                            if tag in preferred:
+                                found[tag] = v
+                        for key in ("DateTimeOriginal", "DateTimeDigitized", "DateTime"):
+                            if key in found:
+                                exif_date = PeneratorTab._normalize_exif_datetime(found[key])
+                                if exif_date:
+                                    break
+                except Exception:
+                    pass
+
+                # --- XMP (fallback) ---
+                if not exif_date:
+                    try:
+                        xmp_bytes = im.info.get("xmp")
+                        if xmp_bytes:
+                            xmp_str = xmp_bytes.decode("utf-8", errors="ignore") if isinstance(xmp_bytes, (bytes, bytearray)) else str(xmp_bytes)
+                            # procurar CreateDate/ModifyDate no XMP
+                            import re
+                            m = re.search(r"(CreateDate|ModifyDate)>([^<]+)<", xmp_str)
+                            if m:
+                                exif_date = PeneratorTab._normalize_exif_datetime(m.group(2))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        return largest, icc_name, exif_date
+
+
+    def _scan_images(self, root: Path) -> Tuple[List[Path], Dict[Path, Tuple[Optional[int], Optional[str], Optional[str]]]]:
         files: List[Path] = []
-        props: Dict[Path, Tuple[Optional[int], Optional[str]]] = {}
+        props: Dict[Path, Tuple[Optional[int], Optional[str], Optional[str]]] = {}
         idx = 0
         for dirpath, _, filenames in os.walk(root):
             for name in filenames:
@@ -1739,16 +2002,86 @@ class PeneratorTab(QWidget):
             return label
 
     @staticmethod
-    def _suffix_from_profile_label(label: str) -> str:
+    def _normalize_input_date_token(token: str) -> List[str]:
         """
-        Normaliza perfil de cor para sufixo: minúsculas, sem espaços/símbolos.
-        Ex.: 'sRGB IEC61966-2.1' -> 'srgbiec6196621' (curto e seguro).
+        Normaliza um token digitado pelo usuário para formas comparáveis.
+        Retorna lista de representações aceitas (com e sem '-').
+        Exemplos:
+        '2024'      -> ['2024']
+        '2024-09'   -> ['2024-09', '202409']
+        '202409'    -> ['2024-09', '202409']
+        '2025-09-24'-> ['2025-09-24', '20250924']
+        '20250924'  -> ['2025-09-24', '20250924']
         """
-        s = label.lower()
-        import re
-        s = re.sub(r"[^a-z0-9]+", "", s)
-        return s or "icc"
+        s = token.strip()
+        if not s:
+            return []
+        s_digits = "".join(ch for ch in s if ch.isdigit())
+        out = set()
 
+        def add_year(y):
+            if len(y) == 4:
+                out.add(y)
+
+        def add_year_month(y, m):
+            if len(y) == 4 and len(m) == 2:
+                out.add(f"{y}-{m}")
+                out.add(f"{y}{m}")
+
+        def add_full(y, m, d):
+            if len(y) == 4 and len(m) == 2 and len(d) == 2:
+                out.add(f"{y}-{m}-{d}")
+                out.add(f"{y}{m}{d}")
+
+        if len(s_digits) == 4:
+            add_year(s_digits)
+        elif len(s_digits) == 6:
+            y, mo = s_digits[:4], s_digits[4:]
+            add_year_month(y, mo)
+        elif len(s_digits) == 8:
+            y, mo, d = s_digits[:4], s_digits[4:6], s_digits[6:]
+            add_full(y, mo, d)
+        else:
+            # Tentar interpretar com hifens se vier 'YYYY-MM' ou 'YYYY-MM-DD'
+            parts = s.replace("/", "-").split("-")
+            if len(parts) == 2 and all(parts):
+                y, mo = parts[0], parts[1]
+                if len(y) == 4 and len(mo) == 2:
+                    add_year_month(y, mo)
+            elif len(parts) == 3 and all(parts):
+                y, mo, d = parts[0], parts[1], parts[2]
+                if len(y) == 4 and len(mo) == 2 and len(d) == 2:
+                    add_full(y, mo, d)
+
+        return list(out)
+
+    @staticmethod
+    def _date_candidates_for_path(exif_ymd: Optional[str], mtime_epoch: float) -> Set[str]:
+        """
+        Gera candidatos de comparação a partir de EXIF (YYYY-MM-DD) e mtime do arquivo.
+        Inclui formas 'YYYY', 'YYYY-MM'/'YYYYMM', 'YYYY-MM-DD'/'YYYYMMDD'.
+        """
+        cands: Set[str] = set()
+        # EXIF
+        try:
+            if exif_ymd:
+                y, m, d = exif_ymd.split("-")
+                cands.add(y)
+                cands.add(f"{y}-{m}"); cands.add(f"{y}{m}")
+                cands.add(f"{y}-{m}-{d}"); cands.add(f"{y}{m}{d}")
+        except Exception:
+            pass
+        # mtime
+        try:
+            import datetime as _dt
+            dt = _dt.datetime.fromtimestamp(mtime_epoch)
+            y, m, d = f"{dt.year:04d}", f"{dt.month:02d}", f"{dt.day:02d}"
+            cands.add(y)
+            cands.add(f"{y}-{m}"); cands.add(f"{y}{m}")
+            cands.add(f"{y}-{m}-{d}"); cands.add(f"{y}{m}{d}")
+        except Exception:
+            pass
+        return cands
     # ---------- Execução do Penerator ----------
     def _run_penerator(self):
         base = self.base_edit.text().strip()
@@ -1787,13 +2120,19 @@ class PeneratorTab(QWidget):
         dest_root.mkdir(parents=True, exist_ok=True)
 
         # 4) Função de match por tipo
-        def match_and_label(p: Path, info: Tuple[Optional[int], Optional[str]], ftype: str, vals: List[str]) -> Optional[str]:
+        def match_and_label(p: Path, info: Tuple[Optional[int], Optional[str], Optional[str]], ftype: str, vals: List[str]) -> Optional[str]:
             """
             Se o arquivo p 'passa' no filtro (ftype, vals), retorna o rótulo (string) a ser usado
             como nome de pasta/sufixo para esse nível. Caso contrário, None.
+
+            info = (largest:int|None, icc_name:str|None, exif_ymd:'YYYY-MM-DD'|None)
             """
             ftype = ftype.lower()
-            largest, icc_name = info
+
+            # extrai de forma segura (compatível com futuras mudanças)
+            largest = info[0] if len(info) > 0 else None
+            icc_name = info[1] if len(info) > 1 else None
+            exif_ymd = info[2] if len(info) > 2 else None
 
             if ftype.startswith("resolução"):  # maior lado
                 try:
@@ -1815,11 +2154,23 @@ class PeneratorTab(QWidget):
                 icc_lower = icc_name.lower()
                 for v in vals:
                     if v.lower() in icc_lower:
-                        # usamos o próprio valor digitado como rótulo (para previsibilidade na hierarquia)
+                        # usa o próprio token digitado como rótulo
                         return v
                 return None
 
-            return None  # tipo desconhecido (não deveria ocorrer)
+            if ftype.startswith("data"):  # data (EXIF/arquivo)
+                try:
+                    mtime = p.stat().st_mtime
+                except Exception:
+                    mtime = 0.0
+                file_date_cands = self._date_candidates_for_path(exif_ymd, mtime)
+                for v in vals:
+                    for norm in self._normalize_input_date_token(v):
+                        if norm in file_date_cands:
+                            return v  # rótulo = token digitado
+                return None
+
+            return None
 
         # 5) Aplicar pipeline (ordem = profundidade da hierarquia)
         moved = 0
@@ -1869,6 +2220,14 @@ class PeneratorTab(QWidget):
                             suffix_tokens.append(self._suffix_from_resolution_label(lab))
                         elif ftype.startswith("perfil"):
                             suffix_tokens.append(self._suffix_from_profile_label(lab))
+                        elif ftype.startswith("data"):
+                            comp = "".join(ch for ch in lab if ch.isdigit())
+                            if len(comp) in (4, 6, 8):
+                                suffix_tokens.append(f"d{comp}")
+                            else:
+                                import re
+                                suffix_tokens.append("d" + re.sub(r"[^0-9a-zA-Z]+", "", lab))
+
                     if suffix_tokens:
                         new_stem = f"{orig_stem}_{'_'.join(suffix_tokens)}"
 
