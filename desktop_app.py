@@ -450,6 +450,7 @@ class DropArea(QLabel):
                     win.analyze_path(paths[0])
 
 
+# -------- Substitua a classe ReplaceDialog (pode permanecer como estava, mas deixei idêntica e com .values) ----
 class ReplaceDialog(QDialog):
     def __init__(self, parent=None, current_name: str = ""):
         super().__init__(parent)
@@ -486,7 +487,135 @@ class ReplaceDialog(QDialog):
     def values(self):
         return self.find_edit.text(), self.repl_edit.text()
 
+from pathlib import Path
+from PySide6.QtWidgets import QMessageBox, QTreeWidgetItem
 
+def apply_replace_to_targets(owner, targets: list, find_text: str, repl_text: str) -> list:
+    """
+    Aplica replace em todos os QTreeWidgetItem de `targets`.
+    - owner: objeto que possui .tree (QTreeWidget) e ROLE_FULLPATH constante.
+    - Retorna: lista de action dicts com info necessária para undo.
+    """
+    actions = []
+    if not find_text:
+        QMessageBox.information(owner, "Replace", "Texto a buscar vazio — nada feito.")
+        return actions
+
+    for item in targets:
+        try:
+            old_name = item.text(0)
+            if find_text not in old_name:
+                continue
+
+            # snapshot da subárvore: guardar ROLE_FULLPATH antigos para todos os nós da subárvore
+            subtree_snapshot = []
+            def _collect_subtree(node):
+                subtree_snapshot.append((node, node.data(0, getattr(owner, "ROLE_FULLPATH", None))))
+                for i in range(node.childCount()):
+                    _collect_subtree(node.child(i))
+            _collect_subtree(item)
+
+            new_name_base = old_name.replace(find_text, repl_text)
+
+            parent = item.parent()
+            sibling_names = set()
+            if parent is None:
+                for i in range(owner.tree.topLevelItemCount()):
+                    sib = owner.tree.topLevelItem(i)
+                    if sib is not item:
+                        sibling_names.add(sib.text(0))
+            else:
+                for i in range(parent.childCount()):
+                    sib = parent.child(i)
+                    if sib is not item:
+                        sibling_names.add(sib.text(0))
+
+            candidate = new_name_base
+            idx = 1
+            while candidate in sibling_names:
+                candidate = f"{new_name_base}_{idx}"
+                idx += 1
+            new_name = candidate
+
+            full = item.data(0, getattr(owner, "ROLE_FULLPATH", None))
+            old_path = None
+            if full:
+                try:
+                    old_path = Path(str(full))
+                except Exception:
+                    old_path = None
+
+            # preparar action base (para undo)
+            action = {
+                "type": "rename",
+                "item_ref": item,          # guardamos a referência do item (válida enquanto o nó existir)
+                "old_name": old_name,
+                "new_name": new_name,
+                "old_path": str(old_path) if old_path else None,
+                "new_path": None,
+                "subtree_snapshot": [(id(n), v) for (n, v) in subtree_snapshot],  # ids e fp antigos
+            }
+
+            # se existe no disco -> renomear no disco e atualizar ROLE_FULLPATH dos filhos
+            final_new = None
+            if old_path and old_path.exists():
+                try:
+                    new_path = old_path.with_name(new_name)
+                    final_new = new_path
+                    i = 1
+                    while final_new.exists():
+                        final_new = new_path.with_name(f"{new_path.stem}_{i}{new_path.suffix}")
+                        i += 1
+                    os.rename(str(old_path), str(final_new))
+                    # atualizar UI
+                    item.setText(0, final_new.name)
+                    item.setData(0, getattr(owner, "ROLE_FULLPATH", 0), str(final_new))
+
+                    # atualizar filhos ROLE_FULLPATH (relativo ao old_path)
+                    def _update_subtree(node, old_pref: Path, new_pref: Path):
+                        for j in range(node.childCount()):
+                            ch = node.child(j)
+                            ch_fp = ch.data(0, getattr(owner, "ROLE_FULLPATH", None))
+                            if ch_fp:
+                                try:
+                                    ch_path = Path(str(ch_fp))
+                                    rel = ch_path.relative_to(old_pref)
+                                    ch.setData(0, getattr(owner, "ROLE_FULLPATH", 0), str(new_pref / rel))
+                                except Exception:
+                                    pass
+                            _update_subtree(ch, old_pref, new_pref)
+                    try:
+                        _update_subtree(item, old_path, final_new)
+                    except Exception:
+                        pass
+
+                    action["new_path"] = str(final_new)
+                except Exception:
+                    # se falhar o rename no disco, tentar apenas renomear na árvore
+                    item.setText(0, new_name)
+                    if old_path:
+                        try:
+                            item.setData(0, getattr(owner, "ROLE_FULLPATH", 0), str(old_path.with_name(new_name)))
+                        except Exception:
+                            pass
+            else:
+                # não existe no disco -> só alterar UI
+                item.setText(0, new_name)
+                if old_path:
+                    try:
+                        item.setData(0, getattr(owner, "ROLE_FULLPATH", 0), str(old_path.with_name(new_name)))
+                    except Exception:
+                        pass
+
+            actions.append(action)
+
+        except Exception:
+            # ignorar item problemático e continuar
+            continue
+
+    if actions:
+        QMessageBox.information(owner, "Replace", f"Renomeados: {len(actions)} (veja undo para reverter).")
+    return actions
 # ======= Aba 2: Hierarquia (visual + templates) =======
 class HierarchyTab(QWidget):
     """
@@ -505,6 +634,9 @@ class HierarchyTab(QWidget):
             super().__init__(owner)
             self.owner = owner
             self._build_ui()
+            self._undo_stack: list = []
+            self._undo_limit = 50
+            self._undo_button = None
             if base_path:
                 self.base_edit.setText(base_path)
                 self.owner._load_fs_into_page(self, base_path)
@@ -581,6 +713,162 @@ class HierarchyTab(QWidget):
             self._register_quick_template_3k4k()
             self._save_templates_to_disk()
         self._add_empty_tab()
+    def _push_undo(self, action: dict):
+        """Adiciona ação no stack e habilita botão."""
+        self._undo_stack.append(action)
+        if len(self._undo_stack) > self._undo_limit:
+            self._undo_stack.pop(0)
+        if self._undo_button:
+            self._undo_button.setEnabled(True)
+
+    def _pop_undo(self) -> Optional[dict]:
+        if not self._undo_stack:
+            return None
+        act = self._undo_stack.pop()
+        if self._undo_button and not self._undo_stack:
+            self._undo_button.setEnabled(False)
+        return act
+
+    def _serialize_item(self, item: QTreeWidgetItem) -> dict:
+        """Serializa um nó recursivamente (texto, flags, ROLE_FULLPATH e filhos)."""
+        data = {
+            "text": item.text(0),
+            "is_dir": bool(item.data(0, self.ROLE_IS_DIR)),
+            "fullpath": item.data(0, self.ROLE_FULLPATH),
+            "children": []
+        }
+        for i in range(item.childCount()):
+            data["children"].append(self._serialize_item(item.child(i)))
+        return data
+
+    def _restore_subtree(self, parent, index: int, data: dict):
+        """
+        Restaura um nó (data) como filho de `parent` na posição `index`.
+        - parent: QTreeWidgetItem ou HierarchyTab._Page (quando top-level, parent==page)
+        """
+        # Determinar página e inserir corretamente
+        if isinstance(parent, HierarchyTab._Page):
+            pg = parent
+            item = self._make_item(pg, data["text"], is_dir=data.get("is_dir", True))
+            # set data
+            if data.get("fullpath") is not None:
+                item.setData(0, self.ROLE_FULLPATH, data["fullpath"])
+            self._ensure_buttons(pg, item)
+            # inserir top-level no índice
+            try:
+                pg.tree.insertTopLevelItem(index, item)
+            except Exception:
+                pg.tree.addTopLevelItem(item)
+            # children
+            for ch in data.get("children", []):
+                self._restore_subtree(item, item.childCount(), ch)
+        else:
+            # parent é QTreeWidgetItem
+            pg = self._page_of_item(parent)
+            item = self._make_item(pg, data["text"], is_dir=data.get("is_dir", True))
+            if data.get("fullpath") is not None:
+                item.setData(0, self.ROLE_FULLPATH, data["fullpath"])
+            self._ensure_buttons(pg, item)
+            try:
+                parent.insertChild(index, item)
+            except Exception:
+                parent.addChild(item)
+            for ch in data.get("children", []):
+                self._restore_subtree(item, item.childCount(), ch)
+
+    def undo_last(self):
+        """Executa o undo da última ação."""
+        act = self._pop_undo()
+        if not act:
+            QMessageBox.information(self, "Desfazer", "Nada a desfazer.")
+            return
+
+        t = act.get("type")
+        try:
+            if t == "add":
+                parent = act.get("parent")
+                idx = act.get("index", 0)
+                # parent None => top-level page
+                if parent is None:
+                    pg = act.get("page") or self._cur_page()
+                    if pg:
+                        # remover o top-level que foi inserido naquela posição (se existir)
+                        try:
+                            it = pg.tree.topLevelItem(idx)
+                            if it:
+                                pg.tree.takeTopLevelItem(idx)
+                        except Exception:
+                            pass
+                else:
+                    # parent é QTreeWidgetItem
+                    try:
+                        parent.takeChild(idx)
+                    except Exception:
+                        pass
+
+            elif t == "remove":
+                parent = act.get("parent")
+                idx = act.get("index", 0)
+                serialized = act.get("data")
+                if parent is None:
+                    pg = act.get("page") or self._cur_page()
+                    if pg and serialized:
+                        self._restore_subtree(pg, idx, serialized)
+                else:
+                    if serialized:
+                        self._restore_subtree(parent, idx, serialized)
+
+            elif t == "rename":
+                # action tem: item_ref, old_name, new_name, old_path, new_path, subtree_snapshot
+                item = act.get("item_ref")
+                if item:
+                    old_name = act.get("old_name")
+                    new_name = act.get("new_name")
+                    old_path = act.get("old_path")
+                    new_path = act.get("new_path")
+                    # primeiro, tentar reverter rename no disco
+                    if new_path and old_path:
+                        try:
+                            npth = Path(new_path)
+                            opth = Path(old_path)
+                            if npth.exists() and not opth.exists():
+                                os.rename(str(npth), str(opth))
+                        except Exception:
+                            pass
+                    # restaurar nome na UI
+                    try:
+                        item.setText(0, old_name)
+                    except Exception:
+                        pass
+                    # restaurar ROLE_FULLPATHs a partir do snapshot se houver
+                    snap = act.get("subtree_snapshot", [])
+                    # snap = list of (id(node), old_fp)
+                    # percorrer e aplicar fp antigos
+                    for node_id, old_fp in snap:
+                        # tentar encontrar o objeto por id (poderíamos guardar referência direta também)
+                        # verificar cada nó da árvore atual e comparar id()
+                        def _apply_to_tree(root):
+                            if id(root) == node_id:
+                                # root é QTreeWidgetItem
+                                try:
+                                    root.setData(0, self.ROLE_FULLPATH, old_fp)
+                                except Exception:
+                                    pass
+                                return True
+                            for j in range(root.childCount()):
+                                if _apply_to_tree(root.child(j)):
+                                    return True
+                            return False
+                        # procurar em todas abas
+                        for pidx in range(self.tabs.count()):
+                            pg = self.tabs.widget(pidx)
+                            if isinstance(pg, HierarchyTab._Page):
+                                for ti in range(pg.tree.topLevelItemCount()):
+                                    top = pg.tree.topLevelItem(ti)
+                                    if _apply_to_tree(top):
+                                        break
+        except Exception as e:
+            QMessageBox.warning(self, "Desfazer", f"Erro ao desfazer: {e}")
 
          # --- Templates: helpers de parsing e diálogos (ADD) ---
     def _parse_template_lines(self, text: str) -> List[List[str]]:
@@ -597,6 +885,130 @@ class HierarchyTab(QWidget):
             if parts:
                 paths.append(parts)
         return paths
+
+    # -------- Adicione dentro de HierarchyTab: --------
+    def _apply_replace_to_targets(self, targets: List[QTreeWidgetItem], find_text: str, repl_text: str):
+        """
+        Aplica replace em todos os itens passados (QTreeWidgetItem).
+        - Se o item tem ROLE_FULLPATH e o caminho existe no disco, tenta renomear no FS.
+        - Se houver conflito de nome entre irmãos, adiciona sufixo _1/_2...
+        - Atualiza ROLE_FULLPATH dos filhos quando uma pasta é renomeada.
+        """
+        if not find_text:
+            QMessageBox.information(self, "Replace", "Texto a buscar vazio — nada feito.")
+            return
+
+        renamed = 0
+        failed = 0
+        skipped = 0
+
+        for item in targets:
+            try:
+                old_name = item.text(0)
+                if find_text not in old_name:
+                    skipped += 1
+                    continue
+                new_name_base = old_name.replace(find_text, repl_text)
+                # garantir unicidade entre irmãos
+                parent = item.parent()
+                sibling_names = set()
+                pg = self._page_of_item(item)
+                if parent is None:
+                    # top-level siblings
+                    for i in range(pg.tree.topLevelItemCount()):
+                        sib = pg.tree.topLevelItem(i)
+                        if sib is not item:
+                            sibling_names.add(sib.text(0))
+                else:
+                    for i in range(parent.childCount()):
+                        sib = parent.child(i)
+                        if sib is not item:
+                            sibling_names.add(sib.text(0))
+
+                candidate = new_name_base
+                idx = 1
+                while candidate in sibling_names:
+                    candidate = f"{new_name_base}_{idx}"
+                    idx += 1
+                new_name = candidate
+
+                # Tentar renomear no disco se tivermos ROLE_FULLPATH
+                full = item.data(0, self.ROLE_FULLPATH)
+                if full:
+                    try:
+                        old_path = Path(str(full))
+                    except Exception:
+                        old_path = None
+                else:
+                    old_path = None
+
+                if old_path and old_path.exists():
+                    # monta new path no mesmo diretório
+                    try:
+                        new_path = old_path.with_name(new_name)
+                    except Exception:
+                        # nomes muito estranhos -> só troca no UI
+                        new_path = None
+
+                    if new_path:
+                        # evitar colisões no disco: se já existe, criar sufixo numérico
+                        final_new = new_path
+                        i = 1
+                        while final_new.exists():
+                            final_new = new_path.with_name(f"{new_path.stem}_{i}{new_path.suffix}")
+                            i += 1
+                        try:
+                            os.rename(str(old_path), str(final_new))
+                        except Exception as e:
+                            # falha física -> não atualizar o UI para evitar inconsistência
+                            failed += 1
+                            continue
+
+                        # atualiza o texto do nó e o ROLE_FULLPATH para o novo caminho
+                        item.setText(0, final_new.name)
+                        item.setData(0, self.ROLE_FULLPATH, str(final_new))
+
+                        # atualizar recursivamente caminhos dos filhos (substitui prefixo)
+                        def _update_subtree_paths(node: QTreeWidgetItem, old_pref: Path, new_pref: Path):
+                            for j in range(node.childCount()):
+                                ch = node.child(j)
+                                ch_fp = ch.data(0, self.ROLE_FULLPATH)
+                                if ch_fp:
+                                    try:
+                                        ch_path = Path(str(ch_fp))
+                                        rel = ch_path.relative_to(old_pref)
+                                        ch.setData(0, self.ROLE_FULLPATH, str(new_pref / rel))
+                                    except Exception:
+                                        # se não for relativo, ignorar
+                                        pass
+                                _update_subtree_paths(ch, old_pref, new_pref)
+
+                        try:
+                            _update_subtree_paths(item, old_path, final_new)
+                        except Exception:
+                            pass
+
+                        renamed += 1
+                        continue  # próximo item
+
+                # Se não há caminho no disco ou não existia: só renomeia na árvore
+                item.setText(0, new_name)
+                # também, se tinha ROLE_FULLPATH mas arquivo não existia, atualizar o ROLE_FULLPATH para refletir novo nome relativo (não obrigatório)
+                if old_path:
+                    try:
+                        item.setData(0, self.ROLE_FULLPATH, str(old_path.with_name(new_name)))
+                    except Exception:
+                        pass
+                renamed += 1
+
+            except Exception:
+                failed += 1
+                continue
+
+        # resumo
+        msg = f"Renomeados: {renamed}\nIgnorados (não continham o texto): {skipped}\nFalhas: {failed}"
+        QMessageBox.information(self, "Replace", msg)
+
 
     def create_template_dialog(self):
         name, ok = QInputDialog.getText(self, "Novo template", "Nome do template:")
@@ -740,8 +1152,17 @@ class HierarchyTab(QWidget):
         btn_new_tab.clicked.connect(self._add_empty_tab)
         btn_open_fs = QPushButton("Abrir pasta…")
         btn_open_fs.clicked.connect(self.load_hierarchy_dialog)
+
+        # NOVO: botão desfazer
+        btn_undo = QPushButton("Desfazer")
+        btn_undo.setEnabled(False)
+        btn_undo.setToolTip("Desfaz a última operação na hierarquia")
+        btn_undo.clicked.connect(self.undo_last)
+        self._undo_button = btn_undo  # salva referência para habilitar/desabilitar
+
         h_tabs.addWidget(btn_new_tab)
         h_tabs.addWidget(btn_open_fs)
+        h_tabs.addWidget(btn_undo)
         h_tabs.addStretch(1)
         v.addLayout(h_tabs)
 
@@ -993,7 +1414,18 @@ class HierarchyTab(QWidget):
                 targets = pg.tree.selectedItems() or [item]
                 old_names_preview = targets[0].text(0) if targets else ""
                 dlg = ReplaceDialog(self, current_name=old_names_preview)
-                dlg.exec()
+                if dlg.exec() == QDialog.Accepted:
+                    find_text, repl_text = dlg.values()
+                    find_text = (find_text or "").strip()
+                    repl_text = (repl_text or "").strip()
+                    if not find_text:
+                        QMessageBox.information(self, "Replace", "Texto a buscar está vazio — operação cancelada.")
+                    else:
+                        actions = apply_replace_to_targets(self, targets, find_text, repl_text)
+                        # empurrar cada action no undo stack (inversão futura)
+                        for a in actions:
+                            # guardar action completa (pode ser usada pelo undo)
+                            self._push_undo(a)
             elif chosen == act_sel_one:
                 pg = self._page_of_item(item)
                 pg.tree.clearSelection()
@@ -1055,6 +1487,15 @@ class HierarchyTab(QWidget):
         self._ensure_buttons(pg, item)
         pg.tree.edit(pg.tree.indexFromItem(item, 0))
 
+        parent_node = ref
+        if parent_node is not None:
+            idx = parent_node.indexOfChild(child)
+            self._push_undo({"type": "add", "parent": parent_node, "index": idx})
+
+        # push undo: remoção do top-level no índice atual
+        idx = pg.tree.indexOfTopLevelItem(item)
+        self._push_undo({"type": "add", "parent": None, "index": idx, "page": pg})
+
     def add_child(self, ref: Optional[QTreeWidgetItem] = None):
         pg = self._cur_page()
         if not pg:
@@ -1084,10 +1525,13 @@ class HierarchyTab(QWidget):
             ref = sel[0]
         parent = ref.parent()
         sib = self._make_item(pg, "nova_pasta")
+        parent = ref.parent() if ref is not None else None
         if parent is None:
-            pg.tree.addTopLevelItem(sib)
+            idx = pg.tree.indexOfTopLevelItem(sib)
+            self._push_undo({"type": "add", "parent": None, "index": idx, "page": pg})
         else:
-            parent.addChild(sib)
+            idx = parent.indexOfChild(sib)
+            self._push_undo({"type": "add", "parent": parent, "index": idx})
         self._ensure_buttons(pg, sib)
         pg.tree.edit(pg.tree.indexFromItem(sib, 0))
 
@@ -1101,10 +1545,17 @@ class HierarchyTab(QWidget):
     def remove_item(self, it: QTreeWidgetItem):
         parent = it.parent()
         pg = self._page_of_item(it)
-        idx = (parent.indexOfChild(it) if parent else pg.tree.indexOfTopLevelItem(it))
         if parent:
+            idx = parent.indexOfChild(it)
+            serialized = self._serialize_item(it)
+            # push undo (remoção -> para desfazer precisa restaurar na parent/index)
+            self._push_undo({"type": "remove", "parent": parent, "index": idx, "data": serialized})
             parent.takeChild(idx)
         else:
+            # top-level
+            idx = pg.tree.indexOfTopLevelItem(it)
+            serialized = self._serialize_item(it)
+            self._push_undo({"type": "remove", "parent": None, "index": idx, "data": serialized, "page": pg})
             pg.tree.takeTopLevelItem(idx)
 
     # -------------- Serialização & criação no disco --------------
@@ -1514,7 +1965,10 @@ class PeneratorDialog(QDialog):
         # rodapé de opções (compacto)
         self.cb_replicate = QCheckBox("Após mover, perguntar onde replicar somente a estrutura")
         self.cb_concat_suffix = QCheckBox("Concatenar filtros ao nome do arquivo")
-        for cb in (self.cb_replicate, self.cb_concat_suffix):
+        # NOVO: opção copiar em vez de mover
+        self.cb_copy = QCheckBox("Copiar (manter arquivos originais)")
+        self.cb_copy.setToolTip("Se marcado, os arquivos serão copiados para o destino em vez de movidos.")
+        for cb in (self.cb_replicate, self.cb_concat_suffix, self.cb_copy):
             cb.setStyleSheet("QCheckBox{spacing:6px;}")
 
         # botões OK/Cancel pequenos
@@ -1530,6 +1984,7 @@ class PeneratorDialog(QDialog):
         v.addLayout(add_bar)
         v.addWidget(self.cb_replicate)
         v.addWidget(self.cb_concat_suffix)
+        v.addWidget(self.cb_copy)
         v.addWidget(btns)
         self._load_filter_templates()
         self._refresh_filter_templates_combo()
@@ -1544,7 +1999,10 @@ class PeneratorDialog(QDialog):
         row.setParent(None)
         row.deleteLater()
 
-    def chosen(self) -> Tuple[List[Tuple[str, List[str]]], bool, bool]:
+    def chosen(self) -> Tuple[List[Tuple[str, List[str]]], bool, bool, bool]:
+        """
+        Retorna: (filters, ask_replicate:bool, concat_suffix:bool, use_copy:bool)
+        """
         filters: List[Tuple[str, List[str]]] = []
         for i in range(self.rows_box.count()):
             w = self.rows_box.itemAt(i).widget()
@@ -1552,7 +2010,7 @@ class PeneratorDialog(QDialog):
                 t, vals = w.spec()
                 if vals:
                     filters.append((t, vals))
-        return filters, self.cb_replicate.isChecked(), self.cb_concat_suffix.isChecked()
+        return filters, self.cb_replicate.isChecked(), self.cb_concat_suffix.isChecked(), self.cb_copy.isChecked()
 
 
 class PeneratorTab(QWidget):
@@ -1794,15 +2252,23 @@ class PeneratorTab(QWidget):
 
         def persistent_menu():
             menu = QMenu(self)
+
             act_sib = menu.addAction("+ Irmão")
             act_child = menu.addAction("+ Filho")
             act_child.setEnabled(is_dir)
             act_rename = menu.addAction("Renomear")
-            act_del = menu.addAction("Remover (da árvore)")
+            act_rename_replace = menu.addAction("Renomear (replace…)")
+
+            act_sel_one = menu.addAction("Selecionar")
+            act_sel_children = menu.addAction("Selecionar todas as filhas")
+            act_sel_siblings = menu.addAction("Selecionar todas as irmãs")
+
+            act_del = menu.addAction("Remover")
 
             chosen = menu.exec(b_more.mapToGlobal(QPoint(0, b_more.height())))
             if not chosen:
                 return
+
             if chosen == act_sib:
                 self.add_sibling(item)
             elif chosen == act_child and is_dir:
@@ -1810,6 +2276,44 @@ class PeneratorTab(QWidget):
             elif chosen == act_rename:
                 idx = self.tree.indexFromItem(item, 0)
                 self.tree.edit(idx)
+            elif chosen == act_rename_replace:
+                targets = self.tree.selectedItems() or [item]
+                old_names_preview = targets[0].text(0) if targets else ""
+                dlg = ReplaceDialog(self, current_name=old_names_preview)
+                if dlg.exec() == QDialog.Accepted:
+                    find_text, repl_text = dlg.values()
+                    find_text = (find_text or "").strip()
+                    repl_text = (repl_text or "").strip()
+                    if not find_text:
+                        QMessageBox.information(self, "Replace", "Texto a buscar está vazio — operação cancelada.")
+                    else:
+                        apply_replace_to_targets(self, targets, find_text, repl_text)
+            elif chosen == act_sel_one:
+                self.tree.clearSelection()
+                item.setSelected(True)
+            elif chosen == act_sel_children:
+                self.tree.clearSelection()
+                def _select_recursive(node: QTreeWidgetItem):
+                    for i in range(node.childCount()):
+                        ch = node.child(i)
+                        ch.setSelected(True)
+                        _select_recursive(ch)
+                _select_recursive(item)
+                if item.childCount() == 0:
+                    item.setSelected(True)
+            elif chosen == act_sel_siblings:
+                self.tree.clearSelection()
+                parent = item.parent()
+                if parent is None:
+                    for i in range(self.tree.topLevelItemCount()):
+                        sib = self.tree.topLevelItem(i)
+                        if sib is not item:
+                            sib.setSelected(True)
+                else:
+                    for i in range(parent.childCount()):
+                        sib = parent.child(i)
+                        if sib is not item:
+                            sib.setSelected(True)
             elif chosen == act_del:
                 self.remove_item(item)
 
@@ -1819,7 +2323,6 @@ class PeneratorTab(QWidget):
         h.addWidget(b_more)
         h.addStretch(1)
         self.tree.setItemWidget(item, 1, w)
-
     def add_child(self, ref: Optional[QTreeWidgetItem] = None):
         if ref is None:
             sel = self.tree.selectedItems()
@@ -2097,7 +2600,7 @@ class PeneratorTab(QWidget):
         dlg = PeneratorDialog(self)
         if dlg.exec() != QDialog.Accepted:
             return
-        filters, ask_replicate, concat_suffix = dlg.chosen()
+        filters, ask_replicate, concat_suffix, use_copy = dlg.chosen()
         if not filters:
             QMessageBox.information(self, "Penerator", "Adicione ao menos um filtro com valores.")
             return
@@ -2235,7 +2738,11 @@ class PeneratorTab(QWidget):
                 target = self._unique_target(cur_dir, target_name)
 
                 try:
-                    shutil.move(str(p), str(target))
+                    if use_copy:
+                        # copia metadados básicos e timestamps (copy2) preservando metadata quando possível
+                        shutil.copy2(str(p), str(target))
+                    else:
+                        shutil.move(str(p), str(target))
                     moved += 1
                 except Exception:
                     skipped += 1
@@ -2244,10 +2751,11 @@ class PeneratorTab(QWidget):
         finally:
             self._end_busy()
 
+        action_word = "copiados" if use_copy else "movidos"
         QMessageBox.information(
             self,
             "Penerator",
-            f"Arquivos movidos: {moved}\nIgnorados (não passaram nos filtros ou falha): {skipped}"
+            f"Arquivos {action_word}: {moved}\nIgnorados (não passaram nos filtros ou falha): {skipped}"
         )
 
         # 6) Atualiza a árvore da ORIGEM
