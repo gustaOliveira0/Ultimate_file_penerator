@@ -2622,22 +2622,14 @@ class PeneratorTab(QWidget):
         dest_root = Path(dest)
         dest_root.mkdir(parents=True, exist_ok=True)
 
-        # 4) Função de match por tipo
+        # 4) Função de match por tipo (mantida)
         def match_and_label(p: Path, info: Tuple[Optional[int], Optional[str], Optional[str]], ftype: str, vals: List[str]) -> Optional[str]:
-            """
-            Se o arquivo p 'passa' no filtro (ftype, vals), retorna o rótulo (string) a ser usado
-            como nome de pasta/sufixo para esse nível. Caso contrário, None.
-
-            info = (largest:int|None, icc_name:str|None, exif_ymd:'YYYY-MM-DD'|None)
-            """
             ftype = ftype.lower()
-
-            # extrai de forma segura (compatível com futuras mudanças)
             largest = info[0] if len(info) > 0 else None
             icc_name = info[1] if len(info) > 1 else None
             exif_ymd = info[2] if len(info) > 2 else None
 
-            if ftype.startswith("resolução"):  # maior lado
+            if ftype.startswith("resolução"):
                 try:
                     targets = {int(v) for v in vals}
                 except Exception:
@@ -2651,17 +2643,16 @@ class PeneratorTab(QWidget):
                 wanted = {v.lower().lstrip(".") for v in vals}
                 return ext if ext in wanted else None
 
-            if ftype.startswith("perfil"):  # perfil de cor
+            if ftype.startswith("perfil"):
                 if not icc_name:
                     return None
                 icc_lower = icc_name.lower()
                 for v in vals:
                     if v.lower() in icc_lower:
-                        # usa o próprio token digitado como rótulo
                         return v
                 return None
 
-            if ftype.startswith("data"):  # data (EXIF/arquivo)
+            if ftype.startswith("data"):
                 try:
                     mtime = p.stat().st_mtime
                 except Exception:
@@ -2670,38 +2661,37 @@ class PeneratorTab(QWidget):
                 for v in vals:
                     for norm in self._normalize_input_date_token(v):
                         if norm in file_date_cands:
-                            return v  # rótulo = token digitado
+                            return v
                 return None
 
             return None
 
-        # 5) Aplicar pipeline (ordem = profundidade da hierarquia)
+        # 5) Aplicar pipeline (ordem = profundidade da hierarquia) — NOVO comportamento
         moved = 0
         skipped = 0
 
+        import re
         self._begin_busy("Organizando arquivos conforme filtros…")
         try:
             for i, p in enumerate(files, 1):
-                info = props.get(p, (None, None))
-                labels: List[str] = []
-                ok = True
+                info = props.get(p, (None, None, None))
+                cur_dir = dest_root
+                matched_labels: List[Tuple[str, str]] = []
+
+                # aplicar cada filtro sequencialmente; se casar => desce para esse nível
                 for ftype, vals in filters:
                     lab = match_and_label(p, info, ftype, vals)
-                    if lab is None:
-                        ok = False
-                        break
-                    labels.append(lab)
+                    if lab is not None:
+                        safe = str(lab).replace("/", "-")
+                        cur_dir = cur_dir / safe
+                        matched_labels.append((ftype, lab))
 
-                if not ok:
+                # comportamento atual: se não casou em nenhum filtro, ignorar (mantive)
+                if not matched_labels:
                     skipped += 1
                     self._pump(i, every=64)
                     continue
 
-                # monta destino aninhado
-                cur_dir = dest_root
-                for lab in labels:
-                    safe = lab.replace("/", "-")
-                    cur_dir = cur_dir / safe
                 try:
                     cur_dir.mkdir(parents=True, exist_ok=True)
                 except Exception:
@@ -2713,23 +2703,27 @@ class PeneratorTab(QWidget):
 
                 new_stem = orig_stem
                 if concat_suffix:
-                    # Para cada filtro NÃO-EXTENSÃO, derivar um sufixo curto
                     suffix_tokens: List[str] = []
-                    for (ftype, _vals), lab in zip(filters, labels):
-                        ftype = ftype.lower()
-                        if ftype == "extensão":
-                            continue  # nunca concatenar extensão
-                        if ftype.startswith("resolução"):
-                            suffix_tokens.append(self._suffix_from_resolution_label(lab))
-                        elif ftype.startswith("perfil"):
-                            suffix_tokens.append(self._suffix_from_profile_label(lab))
-                        elif ftype.startswith("data"):
-                            comp = "".join(ch for ch in lab if ch.isdigit())
+                    for ftype, lab in matched_labels:
+                        ft_lower = ftype.lower()
+                        if ft_lower == "extensão":
+                            continue  # não concatenar extensão
+                        if ft_lower.startswith("resolução"):
+                            try:
+                                suffix_tokens.append(self._suffix_from_resolution_label(str(lab)))
+                            except Exception:
+                                suffix_tokens.append(re.sub(r"[^0-9a-zA-Z]+", "", str(lab)))
+                        elif ft_lower.startswith("perfil"):
+                            # perfil -> simplifica caracteres
+                            suffix_tokens.append(re.sub(r"[^0-9a-zA-Z]+", "", str(lab)))
+                        elif ft_lower.startswith("data"):
+                            comp = "".join(ch for ch in str(lab) if ch.isdigit())
                             if len(comp) in (4, 6, 8):
                                 suffix_tokens.append(f"d{comp}")
                             else:
-                                import re
-                                suffix_tokens.append("d" + re.sub(r"[^0-9a-zA-Z]+", "", lab))
+                                suffix_tokens.append("d" + re.sub(r"[^0-9a-zA-Z]+", "", str(lab)))
+                        else:
+                            suffix_tokens.append(re.sub(r"[^0-9a-zA-Z]+", "", str(lab)))
 
                     if suffix_tokens:
                         new_stem = f"{orig_stem}_{'_'.join(suffix_tokens)}"
@@ -2739,7 +2733,6 @@ class PeneratorTab(QWidget):
 
                 try:
                     if use_copy:
-                        # copia metadados básicos e timestamps (copy2) preservando metadata quando possível
                         shutil.copy2(str(p), str(target))
                     else:
                         shutil.move(str(p), str(target))
@@ -2755,7 +2748,7 @@ class PeneratorTab(QWidget):
         QMessageBox.information(
             self,
             "Penerator",
-            f"Arquivos {action_word}: {moved}\nIgnorados (não passaram nos filtros ou falha): {skipped}"
+            f"Arquivos {action_word}: {moved}\nIgnorados (não passaram em nenhum filtro ou falha): {skipped}"
         )
 
         # 6) Atualiza a árvore da ORIGEM
