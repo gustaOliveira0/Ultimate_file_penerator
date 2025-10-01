@@ -316,7 +316,7 @@ def open_any_image(source: Any) -> Image.Image:
 # ------------------ UI (PySide6) ------------------
 from PySide6.QtCore import Qt, QTimer, QObject, QEvent, QPoint, QRect
 from PySide6.QtWidgets import QDialog, QFileDialog
-from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QPlainTextEdit, QMessageBox,
@@ -2028,6 +2028,8 @@ class PeneratorTab(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._undo_stack: List[Dict[str, Any]] = []
+        self._undo_limit = 10
         self._busy_timer: Optional[QTimer] = None
         self._progress: Optional[QProgressDialog] = None
         self._build_ui()
@@ -2091,11 +2093,25 @@ class PeneratorTab(QWidget):
         self.btn_penerator.setEnabled(False)
         self.btn_penerator.clicked.connect(self._run_penerator)
 
+        # botão DESFAZER do Penerator
+        self.btn_undo = QPushButton("Desfazer Penerator")
+        self.btn_undo.setEnabled(False)
+        self.btn_undo.setToolTip("Desfaz a última operação do Penerator (Ctrl+Z)")
+        self.btn_undo.clicked.connect(self.undo_last_penerator)
+
         h.addWidget(btn_open)
         h.addWidget(self.base_edit)
         h.addWidget(btn_refresh)
         h.addWidget(self.btn_penerator)
+        h.addWidget(self.btn_undo)
         v.addLayout(h)
+
+        # atalho Ctrl+Z para desfazer o último run do Penerator
+        try:
+            shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
+            shortcut.activated.connect(self.undo_last_penerator)
+        except Exception:
+            pass
 
         # Árvore com lazy-load
         self.tree = QTreeWidget()
@@ -2585,6 +2601,227 @@ class PeneratorTab(QWidget):
         except Exception:
             pass
         return cands
+    def undo_last_penerator(self):
+        """
+        Desfaz o último run do Penerator (move de volta ou remove cópias).
+        Remove também as pastas criadas por esse run sempre que for seguro:
+        - Só remove uma pasta se TODOS os arquivos contidos nela (recursivamente)
+          forem arquivos criados pelo run (estão em actions[*]['dst']) OU
+          forem arquivos ignóraveis do sistema (ex.: .DS_Store, Thumbs.db).
+        """
+        import os, stat
+
+        if not getattr(self, "_undo_stack", None):
+            QMessageBox.information(self, "Desfazer Penerator", "Nada a desfazer.")
+            return
+
+        entry = self._undo_stack.pop()
+        actions = entry.get("actions", [])
+        created_dirs = entry.get("created_dirs", [])
+
+        # normalizar paths -> usar abspath + normpath
+        def norm(p: str) -> str:
+            try:
+                return os.path.normpath(os.path.abspath(str(p)))
+            except Exception:
+                return os.path.normpath(str(p))
+
+        created_files = set()
+        for act in actions:
+            dst = act.get("dst")
+            if dst:
+                created_files.add(norm(dst))
+
+        # arquivos do SO que podemos remover sem culpa
+        IGNORABLE_FILENAMES = {".DS_Store", "Thumbs.db", "desktop.ini", ".localized"}
+
+        reverted = 0
+        failed = 0
+
+        # 1) Reverter ações (arquivos) em ordem inversa
+        for act in reversed(actions):
+            op = act.get("op")
+            src_raw = act.get("src")
+            dst_raw = act.get("dst")
+            src = Path(src_raw) if src_raw else None
+            dst = Path(dst_raw) if dst_raw else None
+            try:
+                if op == "move":
+                    # mover de volta: dst -> src
+                    if dst and dst.exists():
+                        target_restore = src if src else None
+                        if target_restore:
+                            # se src existe, criar nome alternativo para nao sobrescrever
+                            if target_restore.exists():
+                                base = target_restore.stem
+                                suf = target_restore.suffix
+                                i = 1
+                                cand = target_restore.with_name(f"{base}_restored_{i}{suf}")
+                                while cand.exists():
+                                    i += 1
+                                    cand = target_restore.with_name(f"{base}_restored_{i}{suf}")
+                                target_restore = cand
+                            try:
+                                target_restore.parent.mkdir(parents=True, exist_ok=True)
+                            except Exception:
+                                pass
+                            try:
+                                # ajustar permissões se necessário
+                                try:
+                                    os.chmod(str(dst), stat.S_IWRITE | stat.S_IREAD)
+                                except Exception:
+                                    pass
+                                shutil.move(str(dst), str(target_restore))
+                                reverted += 1
+                            except Exception:
+                                failed += 1
+                        else:
+                            failed += 1
+                    else:
+                        failed += 1
+                elif op == "copy":
+                    # deletar o arquivo copiado (dst)
+                    if dst and dst.exists():
+                        try:
+                            try:
+                                os.chmod(str(dst), stat.S_IWRITE | stat.S_IREAD)
+                            except Exception:
+                                pass
+                            dst.unlink()
+                            reverted += 1
+                        except Exception:
+                            failed += 1
+                    else:
+                        # já não existe
+                        pass
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+                continue
+
+        # 2) Agora, tentativa robusta de remover diretórios criados por este run
+        removed_dirs = 0
+        failed_dirs = 0
+        remaining_dirs = []
+
+        try:
+            # normalizar e ordenar por profundidade descendente
+            norm_dirs = [norm(d) for d in created_dirs]
+            norm_dirs = sorted(set(norm_dirs), key=lambda s: len(Path(s).parts), reverse=True)
+
+            for d in norm_dirs:
+                try:
+                    p = Path(d)
+                    if not p.exists() or not p.is_dir():
+                        # já removido -> ok
+                        continue
+
+                    # coletar todos os arquivos recursivamente dentro de p
+                    all_files = [f for f in p.rglob("*") if f.is_file()]
+
+                    # normalizar lista de arquivos (strings)
+                    all_files_norm = [norm(str(f)) for f in all_files]
+
+                    # Se houver arquivos, verificar se todos são "seguramente removíveis":
+                    # - estão em created_files OR
+                    # - têm nomes ignóraveis (ex: .DS_Store)
+                    removable = True
+                    for af, af_norm in zip(all_files, all_files_norm):
+                        name = af.name
+                        if af_norm in created_files:
+                            continue
+                        if name in IGNORABLE_FILENAMES:
+                            # aceitável, vamos apagar depois
+                            continue
+                        # Se encontramos um arquivo que NÃO pertence ao run e não é ignóravel => abortar remoção
+                        removable = False
+                        break
+
+                    if not removable:
+                        remaining_dirs.append(d)
+                        failed_dirs += 1
+                        continue
+
+                    # Apagar arquivos: primeiro remover arquivos criados ou ignoráveis
+                    for af, af_norm in zip(all_files, all_files_norm):
+                        try:
+                            # ignorar caso já removido
+                            if not af.exists():
+                                continue
+                            # se af não estiver em created_files e for ignóravel -> apagar
+                            if af_norm in created_files or af.name in IGNORABLE_FILENAMES:
+                                try:
+                                    os.chmod(str(af), stat.S_IWRITE | stat.S_IREAD)
+                                except Exception:
+                                    pass
+                                af.unlink()
+                            else:
+                                # não deveria chegar aqui (já checado), mas pular
+                                pass
+                        except Exception:
+                            # se falha ao apagar arquivo, marcar e abortar remoção desta pasta
+                            removable = False
+                            break
+
+                    if not removable:
+                        remaining_dirs.append(d)
+                        failed_dirs += 1
+                        continue
+
+                    # Remover subdiretórios vazios (do mais profundo ao raso)
+                    # listar subdirs ordenados por profundidade decrescente
+                    subdirs = sorted([x for x in p.rglob("*") if x.is_dir()], key=lambda x: len(x.parts), reverse=True)
+                    for sd in subdirs:
+                        try:
+                            sd.rmdir()
+                        except Exception:
+                            # se não vazia, ignora
+                            pass
+
+                    # Remover a própria p
+                    try:
+                        p.rmdir()
+                        removed_dirs += 1
+                    except Exception:
+                        # pode não estar vazia ou permissão falhou
+                        remaining_dirs.append(d)
+                        failed_dirs += 1
+
+                except Exception:
+                    failed_dirs += 1
+                    remaining_dirs.append(d)
+                    continue
+        except Exception:
+            # falha inesperada na limpeza de diretórios: reportar sem quebrar
+            pass
+
+        # desabilitar botão se nada mais para desfazer
+        if not self._undo_stack:
+            try:
+                self.btn_undo.setEnabled(False)
+            except Exception:
+                pass
+
+        # mensagem final (resumida)
+        summary = (
+            f"Arquivos revertidos: {reverted}\n"
+            f"Falhas ao reverter arquivos: {failed}\n\n"
+            f"Pastas removidas: {removed_dirs}\n"
+            f"Pastas não removidas: {failed_dirs}\n"
+        )
+        if remaining_dirs:
+            # mostrar até 10 diretórios restantes para diagnóstico
+            show = remaining_dirs[:10]
+            summary += "\nPastas restantes (ex.):\n" + "\n".join(show)
+            if len(remaining_dirs) > 10:
+                summary += f"\n... e mais {len(remaining_dirs)-10} dirs."
+
+        QMessageBox.information(self, "Desfazer Penerator", summary)
+
+        self._refresh_current_view()
+
+        
     # ---------- Execução do Penerator ----------
     def _run_penerator(self):
         base = self.base_edit.text().strip()
@@ -2605,6 +2842,10 @@ class PeneratorTab(QWidget):
             QMessageBox.information(self, "Penerator", "Adicione ao menos um filtro com valores.")
             return
 
+        # Inicializa run_actions desde o começo (evita NameError)
+        run_actions: List[Dict[str, Any]] = []
+        run_created_dirs: Set[str] = set() 
+
         # 2) Escanear imagens
         self._begin_busy("Escaneando imagens…")
         try:
@@ -2622,7 +2863,7 @@ class PeneratorTab(QWidget):
         dest_root = Path(dest)
         dest_root.mkdir(parents=True, exist_ok=True)
 
-        # 4) Função de match por tipo (mantida)
+        # 4) Função de match por tipo
         def match_and_label(p: Path, info: Tuple[Optional[int], Optional[str], Optional[str]], ftype: str, vals: List[str]) -> Optional[str]:
             ftype = ftype.lower()
             largest = info[0] if len(info) > 0 else None
@@ -2666,7 +2907,7 @@ class PeneratorTab(QWidget):
 
             return None
 
-        # 5) Aplicar pipeline (ordem = profundidade da hierarquia) — NOVO comportamento
+        # 5) Aplicar pipeline (ordem = profundidade da hierarquia)
         moved = 0
         skipped = 0
 
@@ -2686,11 +2927,29 @@ class PeneratorTab(QWidget):
                         cur_dir = cur_dir / safe
                         matched_labels.append((ftype, lab))
 
-                # comportamento atual: se não casou em nenhum filtro, ignorar (mantive)
+                # se não casou em nenhum filtro -> ignorar (comportamento atual)
                 if not matched_labels:
                     skipped += 1
                     self._pump(i, every=64)
                     continue
+
+                try:
+                    # montar lista de ancestrais entre dest_root (excluído) e cur_dir (incluído)
+                    to_check = []
+                    tmp = cur_dir
+                    # evita loop infinito: limita profundidade razoável (ex: 128)
+                    depth_guard = 0
+                    while tmp != dest_root and depth_guard < 512:
+                        to_check.append(tmp)
+                        tmp = tmp.parent
+                        depth_guard += 1
+                    # checar da raiz para o destino (ordem de criação)
+                    for anc in reversed(to_check):
+                        if not anc.exists():
+                            run_created_dirs.add(str(anc))
+                except Exception:
+                    # se algo falhar, não bloquear o processamento
+                    pass
 
                 try:
                     cur_dir.mkdir(parents=True, exist_ok=True)
@@ -2714,7 +2973,6 @@ class PeneratorTab(QWidget):
                             except Exception:
                                 suffix_tokens.append(re.sub(r"[^0-9a-zA-Z]+", "", str(lab)))
                         elif ft_lower.startswith("perfil"):
-                            # perfil -> simplifica caracteres
                             suffix_tokens.append(re.sub(r"[^0-9a-zA-Z]+", "", str(lab)))
                         elif ft_lower.startswith("data"):
                             comp = "".join(ch for ch in str(lab) if ch.isdigit())
@@ -2734,8 +2992,10 @@ class PeneratorTab(QWidget):
                 try:
                     if use_copy:
                         shutil.copy2(str(p), str(target))
+                        run_actions.append({"op": "copy", "src": str(p), "dst": str(target)})
                     else:
                         shutil.move(str(p), str(target))
+                        run_actions.append({"op": "move", "src": str(p), "dst": str(target)})
                     moved += 1
                 except Exception:
                     skipped += 1
@@ -2764,6 +3024,28 @@ class PeneratorTab(QWidget):
                 finally:
                     self._end_busy()
                 QMessageBox.information(self, "Penerator", "Estrutura replicada com sucesso.")
+
+        # 8) Empurra a run para a pilha de undo (se houver ações)
+        try:
+            if run_actions:
+                if not hasattr(self, "_undo_stack"):
+                    self._undo_stack = []
+                    self._undo_limit = getattr(self, "_undo_limit", 10)
+                run_entry = {
+                    "type": "penerator_run",
+                    "actions": run_actions,
+                    "created_dirs": sorted(list(run_created_dirs))  # lista persistível
+                }
+                self._undo_stack.append(run_entry)
+                # limitar tamanho
+                if len(self._undo_stack) > getattr(self, "_undo_limit", 10):
+                    self._undo_stack.pop(0)
+                # habilitar botão (se existir)
+                if hasattr(self, "btn_undo"):
+                    self.btn_undo.setEnabled(True)
+        except Exception:
+            # não quebrar o fluxo principal por causa do undo
+            pass
 
 def _choose_open_file(parent, title="Abrir arquivo", name_filter=""):
     dlg = QFileDialog(parent, title)
