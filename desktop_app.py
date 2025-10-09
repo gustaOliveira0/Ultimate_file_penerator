@@ -1,38 +1,4 @@
-"""
-Image Metadata Desktop App (PySide6)
------------------------------------
-
-• App desktop (Windows/macOS/Linux) com 3 ferramentas em abas:
-  1) Metadados: drag & drop, abrir arquivo, caminho absoluto → JSON seguro.
-  2) Hierarquia (visual): editor de árvore + gerenciador de **templates de hierarquia**:
-     - Criar template por texto (uma linha por caminho; '/' separa níveis)
-     - Salvar/Carregar templates em JSON (persistido em %APPDATA%/Library/.config)
-     - Aplicar template em múltiplas pastas selecionadas (sem duplicar nós)
-     - Atalhos rápidos (3k/4k com jpg/png)
-     - Lazy loading do FS com setinha/expander
-
-  3) File Penerator (NOVO):
-     - Escolher diretório de origem (lazy, igual à Hierarquia)
-     - Botão “Penerator” abre diálogo com filtros multi-seleção:
-         ▸ Extensões (auto detectadas no diretório)
-         ▸ Resoluções/buckets (4k/5k; auto detecta disponíveis)
-     - Solicita pasta destino para **criar estrutura** combinando filtros (ex.: jpg/4k, png/5k, …)
-     - Move as imagens da origem para dentro dos buckets correspondentes (ext/res)
-     - Após mover, pergunta um **segundo destino opcional** para replicar SOMENTE a estrutura (sem arquivos)
-
-Instalação (cobertura ampla de formatos)
-  pip install -U PySide6 pillow pillow-heif pillow-avif-plugin pillow-jxl-plugin \
-      rawpy imagecodecs opencv-python imageio pyvips cairosvg Wand pdf2image
-
-Executar
-  python desktop_app.py
-
-Empacotar (ex.: Windows)
-  pip install pyinstaller
-  pyinstaller --noconfirm --onefile --windowed --name ImgMetaApp desktop_app.py
-"""
 from __future__ import annotations
-
 import json
 from io import BytesIO
 from pathlib import Path
@@ -45,6 +11,13 @@ from PIL import Image, ImageCms
 from PIL import ImageFile
 from PIL.ExifTags import TAGS, GPSTAGS
 from PIL.TiffImagePlugin import IFDRational
+from PySide6.QtCore import Qt, QPoint
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTabWidget,
+    QTreeWidget, QTreeWidgetItem, QHeaderView, QAbstractItemView, QLineEdit,
+    QMessageBox, QStyle, QDialog
+)
+
 
 # Tolerar arquivos parcialmente truncados/maiores
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -451,42 +424,40 @@ class DropArea(QLabel):
 
 
 # -------- Substitua a classe ReplaceDialog (pode permanecer como estava, mas deixei idêntica e com .values) ----
-class ReplaceDialog(QDialog):
-    def __init__(self, parent=None, current_name: str = ""):
+class _ReplaceDialog(QDialog):
+    def __init__(self, parent=None, initial_find: str = "", initial_repl: str = ""):
         super().__init__(parent)
         self.setWindowTitle("Renomear (replace)")
-        lay = QVBoxLayout(self)
+        self.setModal(True)
 
-        hl = QHBoxLayout()
-        self.find_edit = QLineEdit()
-        self.find_edit.setPlaceholderText("procurar (ex.: shot_10)")
+        v = QVBoxLayout(self)
+
+        row = QHBoxLayout()
+        self.ed_find = QLineEdit(initial_find)
+        self.ed_find.setPlaceholderText("Texto a buscar…")
         arrow = QLabel("→")
-        arrow.setStyleSheet("font-weight: bold; padding: 0 8px;")
-        self.repl_edit = QLineEdit()
-        self.repl_edit.setPlaceholderText("substituir por (ex.: pzd_1)")
+        arrow.setAlignment(Qt.AlignCenter)
+        self.ed_repl = QLineEdit(initial_repl)
+        self.ed_repl.setPlaceholderText("Substituir por… (pode ser vazio)")
 
-        hl.addWidget(self.find_edit)
-        hl.addWidget(arrow)
-        hl.addWidget(self.repl_edit)
-        lay.addLayout(hl)
+        row.addWidget(self.ed_find, 1)
+        row.addWidget(arrow)
+        row.addWidget(self.ed_repl, 1)
 
-        if current_name:
-            hint = QLabel(f"Nome atual: <b>{current_name}</b>")
-            hint.setStyleSheet("color: #666;")
-            lay.addWidget(hint)
-
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
-        lay.addWidget(btns)
 
-    def showEvent(self, e):
-        super().showEvent(e)
-        _center_dialog(self, self.parent())
+        v.addLayout(row)
+        v.addWidget(btns)
 
-    def values(self):
-        return self.find_edit.text(), self.repl_edit.text()
+        # Enter confirma
+        self.ed_repl.returnPressed.connect(self.accept)
+        self.ed_find.setFocus()
 
+    def values(self) -> tuple[str, str]:
+        return self.ed_find.text(), self.ed_repl.text()
+    
 from pathlib import Path
 from PySide6.QtWidgets import QMessageBox, QTreeWidgetItem
 
@@ -616,14 +587,26 @@ def apply_replace_to_targets(owner, targets: list, find_text: str, repl_text: st
     if actions:
         QMessageBox.information(owner, "Replace", f"Renomeados: {len(actions)} (veja undo para reverter).")
     return actions
-# ======= Aba 2: Hierarquia (visual + templates) =======
+
+# ---- Helpers que o módulo original provavelmente tinha em utilidades ----
+def _choose_directory(parent: QWidget, title: str) -> Optional[str]:
+    
+    from PySide6.QtWidgets import QFileDialog
+    d = QFileDialog.getExistingDirectory(parent, title)
+    return d if d else None
+
+
 class HierarchyTab(QWidget):
     """
-    Nova implementação do módulo de Hierarquia:
+    Hierarquia reativa:
     - Abrir pasta (lazy-load)
     - Criar / Renomear / Excluir pastas REATIVAMENTE (operações no disco imediatamente)
-    - Templates simples (salvar/carregar/apply) para aplicar estruturas inteiras em uma pasta
-    - UI com botões '+ / ⋯' por nó (como antes)
+    - Botões '+ / ⋯' por nó e atalhos rápidos
+    - Reverter a última operação (create/delete/rename)
+    /*************  ✨ Windsurf Command ⭐  *************/
+    """
+    """
+/*******  3482aeea-9fde-4621-bcf3-ee9da6804f80  *******/- REMOVIDO: todo o suporte a templates
     """
 
     ROLE_FULLPATH = Qt.UserRole + 1
@@ -634,12 +617,9 @@ class HierarchyTab(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._vp2page = {}
-        self.templates: Dict[str, List[List[str]]] = {}
+        self._vp2page: Dict[object, 'HierarchyTab._Page'] = {}
+        self._last_op: Optional[Dict[str, Any]] = None  # armazena somente a ÚLTIMA operação
         self._build_ui()
-        # carregar templates salvos (se houver)
-        self._load_templates_from_disk()
-        # criar aba vazia inicial
         self._add_empty_tab()
 
     # ----------------- UI / tabs -----------------
@@ -656,13 +636,23 @@ class HierarchyTab(QWidget):
         btn_open_fs = QPushButton("Abrir pasta…")
         btn_open_fs.clicked.connect(self.load_hierarchy_dialog)
 
+        # Botão global de UNDO (reverter a última operação)
+        btn_undo = QPushButton("Reverter última ação")
+        btn_undo.clicked.connect(self.undo_last_operation)
+
         h_tabs.addWidget(btn_new_tab)
         h_tabs.addWidget(btn_open_fs)
         h_tabs.addStretch(1)
+        h_tabs.addWidget(btn_undo)
         v.addLayout(h_tabs)
-
-        # Templates group (simples)
-        v.addWidget(self._build_templates_group())
+    def _ensure_lazy_placeholder(self, it: QTreeWidgetItem):
+        """Garante que o item de pasta tenha um placeholder '…' para lazy-load."""
+        if not bool(it.data(0, self.ROLE_IS_DIR)):
+            return
+        # evita duplicar dummy
+        if it.childCount() == 1 and it.child(0).text(0) == self.DUMMY_MARK:
+            return
+        it.addChild(QTreeWidgetItem([self.DUMMY_MARK, ""]))
 
     def _on_tab_close(self, idx: int):
         w = self.tabs.widget(idx)
@@ -709,7 +699,7 @@ class HierarchyTab(QWidget):
             self.tree.setAnimated(True)
             self.tree.itemExpanded.connect(self.owner._on_item_expanded)
             self.tree.itemCollapsed.connect(self.owner._on_item_collapsed)
-            # Quando terminar edição do texto do item, chamar handler do owner
+            # Renomear reativo
             self.tree.itemChanged.connect(self.owner._on_item_changed)
             v.addWidget(self.tree)
 
@@ -794,56 +784,53 @@ class HierarchyTab(QWidget):
             dirs.sort(key=lambda e: e.name.lower())
             files.sort(key=lambda e: e.name.lower())
 
-            # adicionar pastas
+            # pastas
             for d in dirs:
                 ch = self._make_dir_item(page, d.name, d.path)
                 parent_item.addChild(ch)
                 self._ensure_buttons(page, ch)
-                # se tem subdirs, colocar dummy para lazy
-                try:
-                    with os.scandir(d.path) as subit:
-                        has_dirs = any(x.is_dir(follow_symlinks=True) for x in subit)
-                except Exception:
-                    has_dirs = False
-                if has_dirs:
-                    ch.addChild(QTreeWidgetItem([self.DUMMY_MARK, ""]))
+                # sempre deixa dummy para permitir expandir e lazy-carregar conteúdo (dirs e/ou arquivos)
+                self._ensure_lazy_placeholder(ch)
 
-            # adicionar arquivos (sem botão de criar filho)
+            # arquivos
             for f in files:
                 ch = self._make_file_item(page, f.name, f.path)
                 parent_item.addChild(ch)
                 self._ensure_buttons(page, ch)
-        except PermissionError:
-            parent_item.setData(0, self.ROLE_HAS_SUBDIRS, 0)
+
         except Exception:
-            parent_item.setData(0, self.ROLE_HAS_SUBDIRS, 0)
+            # não precisamos mais mexer em ROLE_HAS_SUBDIRS
+            pass
 
     def _on_item_expanded(self, it: QTreeWidgetItem):
-        # lazy-load: se placeholder, trocar
-        if it.childCount() == 1 and it.child(0).text(0) == self.DUMMY_MARK:
-            it.takeChildren()
-            pg = self._page_of_item(it)
-            if not pg:
-                return
-            base = it.data(0, self.ROLE_FULLPATH)
-            if not base:
-                return
-            self._begin_busy(f"Lendo “{Path(base).name}”…")
-            try:
-                self._load_children_for_item(pg, it, str(base))
-            finally:
-                self._end_busy()
+        pg = self._page_of_item(it)
+        if not pg:
+            return
+        base = it.data(0, self.ROLE_FULLPATH)
+        if not base:
+            return
+
+        should_lazy = (it.childCount() == 0) or (it.childCount() == 1 and it.child(0).text(0) == self.DUMMY_MARK)
+        if not should_lazy:
+            return
+
+        # limpa dummy (se havia) e carrega
+        it.takeChildren()
+        self._begin_busy(f"Lendo “{Path(str(base)).name}”…")
+        try:
+            self._load_children_for_item(pg, it, str(base))
+        finally:
+            self._end_busy()
 
     def _on_item_collapsed(self, it: QTreeWidgetItem):
-        # liberar widgets filhos para economizar memória
         pg = self._page_of_item(it)
         if not pg:
             return
         self._free_subtree_widgets(it)
-        has_sub = bool(it.data(0, self.ROLE_HAS_SUBDIRS))
+
         it.takeChildren()
-        if has_sub:
-            it.addChild(QTreeWidgetItem([self.DUMMY_MARK, ""]))
+        if bool(it.data(0, self.ROLE_IS_DIR)):
+            self._ensure_lazy_placeholder(it)
 
     def _free_subtree_widgets(self, item: QTreeWidgetItem):
         pg = self._page_of_item(item)
@@ -944,7 +931,6 @@ class HierarchyTab(QWidget):
         item = self._make_item(pg, desired_name, is_dir=True)
         pg.tree.addTopLevelItem(item)
         self._ensure_buttons(pg, item)
-        # criação imediata no disco (se base set)
         created_path = None
         parent_disk = self._get_disk_parent_path_for_item(None, pg)
         if parent_disk is None:
@@ -953,9 +939,10 @@ class HierarchyTab(QWidget):
         else:
             created = self._create_folder_on_disk(parent_disk, desired_name)
             if created:
-                # guardar fullpath real, mas mostrar o nome editável para o usuário
                 item.setData(0, self.ROLE_FULLPATH, str(created))
                 created_path = str(created)
+        # registrar última operação (create)
+        self._last_op = {"type": "create", "path": created_path, "item": item}
         # editar inline imediatamente
         pg.tree.edit(pg.tree.indexFromItem(item, 0))
 
@@ -976,12 +963,10 @@ class HierarchyTab(QWidget):
         desired_name = "subpasta"
         parent_disk = self._get_disk_parent_path_for_item(ref, pg)
         created_path = None
-        real_name = desired_name
         if parent_disk:
             created = self._create_folder_on_disk(parent_disk, desired_name)
             if created:
                 created_path = str(created)
-                # mostramos 'subpasta' mas guardamos ROLE_FULLPATH do criado
                 child = self._make_item(pg, desired_name, is_dir=True)
                 child.setData(0, self.ROLE_FULLPATH, created_path)
         else:
@@ -990,6 +975,8 @@ class HierarchyTab(QWidget):
         ref.addChild(child)
         self._ensure_buttons(pg, child)
         ref.setExpanded(True)
+        # registrar última operação (create)
+        self._last_op = {"type": "create", "path": created_path, "item": child}
         pg.tree.edit(pg.tree.indexFromItem(child, 0))
 
     def add_sibling(self, ref: Optional[QTreeWidgetItem] = None):
@@ -1005,6 +992,8 @@ class HierarchyTab(QWidget):
         parent = ref.parent()
         desired_name = "nova_pasta"
         sib = self._make_item(pg, desired_name, is_dir=True)
+        created_path = None
+
         if parent is None:
             try:
                 insert_at = pg.tree.indexOfTopLevelItem(ref) + 1
@@ -1016,6 +1005,7 @@ class HierarchyTab(QWidget):
                 created = self._create_folder_on_disk(parent_disk, desired_name)
                 if created:
                     sib.setData(0, self.ROLE_FULLPATH, str(created))
+                    created_path = str(created)
             else:
                 QMessageBox.information(self, "Pasta base ausente",
                                         "Defina 'Pasta base desta aba' para que a pasta seja criada no disco.")
@@ -1031,18 +1021,43 @@ class HierarchyTab(QWidget):
                 created = self._create_folder_on_disk(parent_disk, desired_name)
                 if created:
                     sib.setData(0, self.ROLE_FULLPATH, str(created))
+                    created_path = str(created)
             else:
                 QMessageBox.information(self, "Pasta base ausente",
                                         "Não foi possível determinar pasta no disco para este nó. Item criado apenas na UI.")
         self._ensure_buttons(pg, sib)
+        # registrar última operação (create)
+        self._last_op = {"type": "create", "path": created_path, "item": sib}
         pg.tree.edit(pg.tree.indexFromItem(sib, 0))
 
     def remove_selected(self):
         pg = self._cur_page()
         if not pg:
             return
-        for it in pg.tree.selectedItems():
+        sel = pg.tree.selectedItems()
+        if not sel:
+            return
+        # para múltiplos, a última operação ficará registrada com base no último removido
+        for it in sel:
             self.remove_item(it)
+
+    def _trash_dir(self) -> Path:
+        p = Path.home() / ".hierarchytab_trash"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def _unique_in_dir(self, base_dir: Path, name: str) -> Path:
+        cand = base_dir / name
+        if not cand.exists():
+            return cand
+        stem = Path(name).stem
+        suf = Path(name).suffix
+        i = 1
+        while True:
+            alt = base_dir / f"{stem}_{i}{suf}"
+            if not alt.exists():
+                return alt
+            i += 1
 
     def remove_item(self, it: QTreeWidgetItem):
         parent = it.parent()
@@ -1053,41 +1068,54 @@ class HierarchyTab(QWidget):
         full = it.data(0, self.ROLE_FULLPATH)
         is_dir = bool(it.data(0, self.ROLE_IS_DIR))
 
+        # info para reverter UI (posição)
+        if parent:
+            idx_in_parent = parent.indexOfChild(it)
+        else:
+            idx_in_parent = pg.tree.indexOfTopLevelItem(it)
+
+        # mover para "lixo" para permitir UNDO
         if full:
             p = Path(str(full))
             if p.exists():
                 if is_dir:
-                    txt = f"Remover a pasta no disco?\n\n{p}\n\n(Se a pasta não estiver vazia você poderá optar por remoção recursiva.)"
+                    txt = f"Remover a pasta no disco?\n\n{p}\n\n(Se a pasta não estiver vazia ela será movida para a lixeira interna para possível reversão.)"
                 else:
-                    txt = f"Remover o arquivo no disco?\n\n{p}"
+                    txt = f"Remover o arquivo no disco?\n\n{p}\n\n(Ele será movido para a lixeira interna para possível reversão.)"
                 resp = QMessageBox.question(self, "Confirmar remoção", txt, QMessageBox.Yes | QMessageBox.No)
                 if resp != QMessageBox.Yes:
                     return
                 try:
-                    if is_dir:
-                        try:
-                            p.rmdir()
-                        except OSError:
-                            force = QMessageBox.question(
-                                self, "Pasta não vazia",
-                                "A pasta não está vazia. Deseja apagar recursivamente TODO o conteúdo?",
-                                QMessageBox.Yes | QMessageBox.No
-                            )
-                            if force == QMessageBox.Yes:
-                                shutil.rmtree(str(p))
-                            else:
-                                return
-                    else:
-                        p.unlink()
+                    trash = self._trash_dir()
+                    dst = self._unique_in_dir(trash, p.name)
+                    shutil.move(str(p), str(dst))
+                    # registrar última operação (delete)
+                    self._last_op = {
+                        "type": "delete",
+                        "orig_path": str(p),
+                        "temp_path": str(dst),
+                        "is_dir": is_dir,
+                        "parent_item": parent,
+                        "idx": idx_in_parent,
+                    }
                 except Exception as e:
-                    QMessageBox.critical(self, "Erro", f"Falha ao apagar: {e}")
+                    QMessageBox.critical(self, "Erro", f"Falha ao mover para lixeira: {e}")
                     return
+        else:
+            # sem caminho no disco: apenas remover da UI; ainda assim permitir undo
+            self._last_op = {
+                "type": "delete_ui_only",
+                "parent_item": parent,
+                "idx": idx_in_parent,
+                "snapshot_name": it.text(0),
+                "was_dir": is_dir,
+            }
 
         # remover do UI
         if parent:
-            parent.takeChild(parent.indexOfChild(it))
+            parent.takeChild(idx_in_parent)
         else:
-            pg.tree.takeTopLevelItem(pg.tree.indexOfTopLevelItem(it))
+            pg.tree.takeTopLevelItem(idx_in_parent)
 
     # ---------- Item Changed: renomear no disco se necessário ----------
     def _on_item_changed(self, item: QTreeWidgetItem, column: int):
@@ -1099,7 +1127,6 @@ class HierarchyTab(QWidget):
             if not new_name:
                 return
             fp = item.data(0, self.ROLE_FULLPATH)
-            # se não tem ROLE_FULLPATH -> nada a renomear no disco (criação ocorreu apenas na UI)
             if not fp:
                 return
 
@@ -1157,6 +1184,16 @@ class HierarchyTab(QWidget):
                 _update_children(item, old_path, new_path)
             except Exception:
                 pass
+
+            # registrar última operação (rename)
+            self._last_op = {
+                "type": "rename",
+                "old_path": str(old_path),
+                "new_path": str(new_path),
+                "item": item,
+                "old_name": old_path.name,
+                "new_name": new_path.name,
+            }
         except Exception:
             pass
 
@@ -1185,11 +1222,18 @@ class HierarchyTab(QWidget):
         return it
 
     def _ensure_buttons(self, page: '_Page', item: QTreeWidgetItem):
-        """
-        Gera o widget de ações à direita (o visual / menu que você já tinha).
-        Mantive os mesmos itens/ações esperados.
-        """
+        """Gera/rega os botões de ação do nó (idempotente)."""
         from PySide6.QtWidgets import QMenu, QWidget, QHBoxLayout
+
+        # ⚠️ Se já existe um widget ali, remova-o com segurança para evitar duplicatas.
+        old = page.tree.itemWidget(item, 1)
+        if old:
+            page.tree.removeItemWidget(item, 1)
+            try:
+                old.deleteLater()
+            except Exception:
+                pass
+
         w = QWidget()
         h = QHBoxLayout(w)
         h.setContentsMargins(0, 0, 0, 0)
@@ -1206,23 +1250,18 @@ class HierarchyTab(QWidget):
 
         def persistent_menu():
             menu = QMenu(self)
-
             act_sib = menu.addAction("+ Irmão")
             act_child = menu.addAction("+ Filho")
             act_child.setEnabled(is_dir)
             act_rename = menu.addAction("Renomear")
-            act_rename_replace = menu.addAction("Renomear (replace…)")
-
             act_sel_one = menu.addAction("Selecionar")
             act_sel_children = menu.addAction("Selecionar todas as filhas")
             act_sel_siblings = menu.addAction("Selecionar todas as irmãs")
-
             act_del = menu.addAction("Remover")
 
             chosen = menu.exec(b_more.mapToGlobal(QPoint(0, b_more.height())))
             if not chosen:
                 return
-
             if chosen == act_sib:
                 self.add_sibling(item)
             elif chosen == act_child and is_dir:
@@ -1230,29 +1269,13 @@ class HierarchyTab(QWidget):
             elif chosen == act_rename:
                 idx = page.tree.indexFromItem(item, 0)
                 page.tree.edit(idx)
-            elif chosen == act_rename_replace:
-                pg = self._page_of_item(item)
-                targets = pg.tree.selectedItems() or [item]
-                old_names_preview = targets[0].text(0) if targets else ""
-                dlg = ReplaceDialog(self, current_name=old_names_preview)
-                if dlg.exec() == QDialog.Accepted:
-                    find_text, repl_text = dlg.values()
-                    find_text = (find_text or "").strip()
-                    repl_text = (repl_text or "").strip()
-                    if not find_text:
-                        QMessageBox.information(self, "Replace", "Texto a buscar está vazio — operação cancelada.")
-                    else:
-                        apply_replace_to_targets(self, targets, find_text, repl_text)
             elif chosen == act_sel_one:
-                page.tree.clearSelection()
-                item.setSelected(True)
+                page.tree.clearSelection(); item.setSelected(True)
             elif chosen == act_sel_children:
                 page.tree.clearSelection()
-                def _select_recursive(node: QTreeWidgetItem):
+                def _select_recursive(node):
                     for i in range(node.childCount()):
-                        ch = node.child(i)
-                        ch.setSelected(True)
-                        _select_recursive(ch)
+                        ch = node.child(i); ch.setSelected(True); _select_recursive(ch)
                 _select_recursive(item)
                 if item.childCount() == 0:
                     item.setSelected(True)
@@ -1262,21 +1285,18 @@ class HierarchyTab(QWidget):
                 if parent is None:
                     for i in range(page.tree.topLevelItemCount()):
                         sib = page.tree.topLevelItem(i)
-                        if sib is not item:
-                            sib.setSelected(True)
+                        if sib is not item: sib.setSelected(True)
                 else:
                     for i in range(parent.childCount()):
                         sib = parent.child(i)
-                        if sib is not item:
-                            sib.setSelected(True)
+                        if sib is not item: sib.setSelected(True)
             elif chosen == act_del:
                 self.remove_item(item)
 
         b_more.clicked.connect(persistent_menu)
-        h.addWidget(b_plus)
-        h.addWidget(b_more)
-        h.addStretch(1)
+        h.addWidget(b_plus); h.addWidget(b_more); h.addStretch(1)
         page.tree.setItemWidget(item, 1, w)
+
 
     def _page_of_item(self, it: QTreeWidgetItem) -> Optional['_Page']:
         for idx in range(self.tabs.count()):
@@ -1286,171 +1306,154 @@ class HierarchyTab(QWidget):
                     return pg
         return self._cur_page()
 
-    # ----------------- Templates (simples: salvar/carregar/aplicar) -----------------
-    def _templates_json_path(self) -> Path:
-        return _templates_json_path()
+    # ----------------- Undo da Última Operação -----------------
+    def undo_last_operation(self):
+        op = self._last_op
+        if not op:
+            QMessageBox.information(self, "Reverter", "Nenhuma operação para reverter.")
+            return
 
-    def _load_templates_from_disk(self):
+        typ = op.get("type")
         try:
-            fp = self._templates_json_path()
-            if fp.exists():
-                data = json.loads(fp.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    fixed = {}
-                    for k, v in data.items():
-                        if isinstance(k, str) and isinstance(v, list) and all(isinstance(p, list) for p in v):
-                            fixed[k] = [[str(x) for x in p] for p in v]
-                    self.templates.update(fixed)
-        except Exception:
-            pass
+            if typ == "create":
+                # apagar a pasta/arquivo criado e remover item da UI
+                path = op.get("path")
+                item = op.get("item")
+                if path:
+                    p = Path(path)
+                    if p.exists():
+                        try:
+                            if p.is_dir():
+                                shutil.rmtree(str(p))
+                            else:
+                                p.unlink()
+                        except Exception as e:
+                            QMessageBox.critical(self, "Reverter", f"Falha ao apagar criação: {e}")
+                            return
+                if item:
+                    pg = self._page_of_item(item)
+                    if pg:
+                        parent = item.parent()
+                        if parent:
+                            parent.takeChild(parent.indexOfChild(item))
+                        else:
+                            idx = pg.tree.indexOfTopLevelItem(item)
+                            if idx >= 0:
+                                pg.tree.takeTopLevelItem(idx)
 
-    def _save_templates_to_disk(self):
-        try:
-            fp = self._templates_json_path()
-            fp.parent.mkdir(parents=True, exist_ok=True)
-            fp.write_text(json.dumps(self.templates, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+            elif typ == "delete":
+                # mover de volta do lixo e recarregar pai
+                orig = Path(op["orig_path"])
+                temp = Path(op["temp_path"])
+                parent_item = op.get("parent_item")
+                idx = op.get("idx", 0)
+                try:
+                    orig.parent.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+                try:
+                    shutil.move(str(temp), str(orig))
+                except Exception as e:
+                    QMessageBox.critical(self, "Reverter", f"Falha ao restaurar da lixeira: {e}")
+                    return
+                # refrescar nó pai no UI
+                if parent_item:
+                    self._refresh_node(parent_item)
+                else:
+                    # top-level: recarregar a aba pela base
+                    pg = self._cur_page()
+                    if pg and pg.base_edit.text().strip():
+                        self._load_root_into_page(pg, pg.base_edit.text().strip())
 
-    def _build_templates_group(self) -> QGroupBox:
-        g = QGroupBox("Templates (aplicar estrutura em uma pasta)")
-        lay = QVBoxLayout(g)
+            elif typ == "delete_ui_only":
+                # recriar item apenas na UI (sem toque no disco)
+                parent_item = op.get("parent_item")
+                idx = op.get("idx", -1)
+                name = op.get("snapshot_name", "item")
+                was_dir = op.get("was_dir", True)
+                pg = self._cur_page()
+                if not pg:
+                    return
+                new_it = self._make_item(pg, name, is_dir=was_dir)
+                self._ensure_buttons(pg, new_it)
+                if parent_item:
+                    if idx >= 0:
+                        parent_item.insertChild(idx, new_it)
+                    else:
+                        parent_item.addChild(new_it)
+                else:
+                    if idx >= 0:
+                        pg.tree.insertTopLevelItem(idx, new_it)
+                    else:
+                        pg.tree.addTopLevelItem(new_it)
 
-        h1 = QHBoxLayout()
-        self.cb_templates = QComboBox()
-        self.cb_templates.setEditable(False)
-        self.cb_templates.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+            elif typ == "rename":
+                # voltar nome antigo
+                old = Path(op["old_path"])
+                new = Path(op["new_path"])
+                item = op.get("item")
+                try:
+                    shutil.move(str(new), str(old))
+                except Exception as e:
+                    QMessageBox.critical(self, "Reverter", f"Falha ao desfazer renomeio: {e}")
+                    return
+                if item:
+                    item.setText(0, old.name)
+                    item.setData(0, self.ROLE_FULLPATH, str(old))
 
-        btn_apply = QPushButton("Aplicar no(s) item(s) selecionado(s)")
-        btn_apply.clicked.connect(self.apply_selected_template_to_selected_parents)
+                    # atualizar filhos (prefix replacement)
+                    def _update_children(node: QTreeWidgetItem, old_pref: Path, new_pref: Path):
+                        for j in range(node.childCount()):
+                            ch = node.child(j)
+                            ch_fp = ch.data(0, self.ROLE_FULLPATH)
+                            if ch_fp:
+                                try:
+                                    ch_path = Path(str(ch_fp))
+                                    rel = ch_path.relative_to(new_pref)
+                                    ch.setData(0, self.ROLE_FULLPATH, str(old_pref / rel))
+                                except Exception:
+                                    pass
+                            _update_children(ch, old_pref, new_pref)
 
-        h1.addWidget(self.cb_templates, 1)
-        h1.addWidget(btn_apply)
-        lay.addLayout(h1)
+                    try:
+                        _update_children(item, old, new)
+                    except Exception:
+                        pass
 
-        h2 = QHBoxLayout()
-        btn_new = QPushButton("Novo template…")
-        btn_new.clicked.connect(self.create_template_dialog)
-        btn_edit = QPushButton("Editar template…")
-        btn_edit.clicked.connect(self.edit_current_template_dialog)
-        btn_del = QPushButton("Remover template")
-        btn_del.clicked.connect(self.delete_current_template)
-        h2.addWidget(btn_new)
-        h2.addWidget(btn_edit)
-        h2.addWidget(btn_del)
-        h2.addStretch(1)
-        lay.addLayout(h2)
+            else:
+                QMessageBox.information(self, "Reverter", "Tipo de operação desconhecido.")
+                return
+        finally:
+            # limpa o histórico (apenas uma operação)
+            self._last_op = None
 
-        self._refresh_templates_combo()
-        return g
-
-    def _refresh_templates_combo(self):
-        try:
-            cur = getattr(self, "cb_templates", None)
-            if cur:
-                cur.blockSignals(True)
-                cur.clear()
-                cur.addItems(sorted(self.templates.keys()))
-                cur.blockSignals(False)
-        except Exception:
-            pass
-
-    def create_template_dialog(self):
-        name, ok = QInputDialog.getText(self, "Novo template", "Nome do template:")
-        if not ok or not name.strip():
-            return
-        text, ok2 = QInputDialog.getMultiLineText(
-            self, "Novo template",
-            "Digite a hierarquia (uma linha por caminho; use '/' para níveis):",
-            "subpasta1/subpasta2\n2025/jpg"
-        )
-        if not ok2:
-            return
-        paths = self._parse_template_lines(text)
-        if not paths:
-            QMessageBox.information(self, "Template", "Nenhum caminho válido informado.")
-            return
-        self.templates[name.strip()] = paths
-        self._save_templates_to_disk()
-        self._refresh_templates_combo()
-        QMessageBox.information(self, "Template", "Template criado e salvo.")
-
-    def edit_current_template_dialog(self):
-        name = self.cb_templates.currentText()
-        if not name or name not in self.templates:
-            QMessageBox.information(self, "Editar template", "Selecione um template.")
-            return
-        current_lines = "\n".join("/".join(p) for p in self.templates[name])
-        new_text, ok = QInputDialog.getMultiLineText(
-            self, f"Editar template: {name}",
-            "Edite a hierarquia (uma linha por caminho; use '/' para níveis):",
-            current_lines
-        )
-        if not ok:
-            return
-        new_paths = self._parse_template_lines(new_text)
-        if not new_paths:
-            QMessageBox.information(self, "Editar template", "Nenhum caminho válido informado.")
-            return
-        self.templates[name] = new_paths
-        self._save_templates_to_disk()
-        self._refresh_templates_combo()
-        QMessageBox.information(self, "Template", "Template atualizado e salvo.")
-
-    def delete_current_template(self):
-        name = self.cb_templates.currentText()
-        if not name or name not in self.templates:
-            return
-        if QMessageBox.question(self, "Remover template", f"Remover '{name}'?") == QMessageBox.Yes:
-            del self.templates[name]
-            self._save_templates_to_disk()
-            self._refresh_templates_combo()
-            QMessageBox.information(self, "Template", "Template removido.")
-
-    def _parse_template_lines(self, text: str) -> List[List[str]]:
-        paths: List[List[str]] = []
-        for raw in text.splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = [p.strip() for p in line.split("/") if p.strip()]
-            if parts:
-                paths.append(parts)
-        return paths
-
-    def apply_selected_template_to_selected_parents(self):
-        name = self.cb_templates.currentText()
-        if not name or name not in self.templates:
-            QMessageBox.information(self, "Aplicar template", "Selecione um template.")
-            return
-        pg = self._cur_page()
+    def _refresh_node(self, it: QTreeWidgetItem):
+        """Colapsa/expande o nó para forçar recarregar (lazy)."""
+        pg = self._page_of_item(it)
         if not pg:
             return
-        sel = [it for it in pg.tree.selectedItems() if bool(it.data(0, self.ROLE_IS_DIR))]
-        if not sel:
-            QMessageBox.information(self, "Aplicar template", "Selecione uma ou mais PASTAS na árvore da aba ativa.")
+        base = it.data(0, self.ROLE_FULLPATH)
+        if not base:
             return
-        for parent in sel:
-            base_disk = self._get_disk_parent_path_for_item(parent, pg)
-            if not base_disk:
-                QMessageBox.information(self, "Aplicar template", "Não foi possível determinar pasta no disco para um dos alvos.")
-                continue
-            for parts in self.templates[name]:
-                # garantir criação sem duplicar: cria a cadeia no disco
-                cur = base_disk
-                for p in parts:
-                    created = self._create_folder_on_disk(cur, p)
-                    if created:
-                        cur = created
-                    else:
-                        cur = cur / p  # tentativa, pode não existir
-        # atualizar view (simples: recarregar raiz da aba)
-        cur_pg = self._cur_page()
-        if cur_pg and cur_pg.base_edit.text().strip():
-            self._load_root_into_page(cur_pg, cur_pg.base_edit.text().strip())
-            QMessageBox.information(self, "Template", "Template aplicado (veja a árvore).")
+        # liberar widgets e filhos, recolocar dummy e expandir
+        self._free_subtree_widgets(it)
+        it.takeChildren()
+        it.addChild(QTreeWidgetItem([self.DUMMY_MARK, ""]))
+        pg.tree.collapseItem(it)
+        pg.tree.expandItem(it)
 
+    # ----------------- Busy no-op (evita crashes se não existir) -----------------
+    def _begin_busy(self, _msg: str = ""):
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+        except Exception:
+            pass
 
+    def _end_busy(self):
+        try:
+            QApplication.restoreOverrideCursor()
+        except Exception:
+            pass
 class _FilterRow(QWidget):
     TYPES = ["Resolução (maior lado)", "Extensão", "Perfil de cor", "Data"]
 
@@ -1656,7 +1659,13 @@ class PeneratorDialog(QDialog):
         self._filter_templates[name] = new_entries
         self._save_filter_templates()
         QMessageBox.information(self, "Templates de filtros", "Template atualizado e salvo.")
-
+        
+    def _ensure_lazy_placeholder(self, it: QTreeWidgetItem):
+        if not bool(it.data(0, self.ROLE_IS_DIR)):
+            return
+        if it.childCount() == 1 and it.child(0).text(0) == self.DUMMY_MARK:
+            return
+        it.addChild(QTreeWidgetItem([self.DUMMY_MARK, ""]))
     def _delete_current_filter_template(self):
         name = self.cb_filter_templates.currentText().strip()
         if not name or name not in self._filter_templates:
@@ -1666,6 +1675,65 @@ class PeneratorDialog(QDialog):
             self._save_filter_templates()
             self._refresh_filter_templates_combo()
             QMessageBox.information(self, "Templates de filtros", "Template removido.")
+
+    def _free_subtree_widgets(self, item: QTreeWidgetItem):
+        """Libera widgets apenas dos DESCENDENTES de 'item' (mantém o do próprio item)."""
+        pg = self._page_of_item(item)
+        if not pg:
+            return
+        stack = []
+        # empilhe apenas os filhos (não o próprio 'item')
+        for i in range(item.childCount()):
+            stack.append(item.child(i))
+        while stack:
+            cur = stack.pop()
+            w = pg.tree.itemWidget(cur, 1)
+            if w:
+                pg.tree.removeItemWidget(cur, 1)
+                try:
+                    w.deleteLater()
+                except Exception:
+                    pass
+            for i in range(cur.childCount()):
+                stack.append(cur.child(i))
+    def _on_item_expanded(self, it: QTreeWidgetItem):
+        # carregar quando vazio ou quando há apenas o dummy
+        pg = self._page_of_item(it)
+        if not pg:
+            return
+        base = it.data(0, self.ROLE_FULLPATH)
+        if not base:
+            return
+
+        should_lazy = (it.childCount() == 0) or (it.childCount() == 1 and it.child(0).text(0) == self.DUMMY_MARK)
+        if not should_lazy:
+            # ainda assim, garanta que o botão de ações está presente
+            self._ensure_buttons(pg, it)
+            return
+
+        it.takeChildren()
+        self._begin_busy(f"Lendo “{Path(str(base)).name}”…")
+        try:
+            self._load_children_for_item(pg, it, str(base))
+        finally:
+            self._end_busy()
+
+        # reassegura que o nó pai mantém seus botões funcionando
+        self._ensure_buttons(pg, it)
+
+    def _on_item_collapsed(self, it: QTreeWidgetItem):
+        pg = self._page_of_item(it)
+        if not pg:
+            return
+        # libera apenas widgets dos descendentes (mantém o do próprio nó!)
+        self._free_subtree_widgets(it)
+        # remove filhos e recoloca dummy para manter a "setinha"
+        it.takeChildren()
+        if bool(it.data(0, self.ROLE_IS_DIR)):
+            it.addChild(QTreeWidgetItem([self.DUMMY_MARK, ""]))
+        # e garante que o botão de ações do nó colapsado continue lá
+        self._ensure_buttons(pg, it)
+
     def __init__(self, parent):
         super().__init__(parent)
         self.setWindowTitle("File Penerator — Filtros")
@@ -1753,6 +1821,15 @@ class PeneratorDialog(QDialog):
     def _add_row(self, initial_type="extensão", initial_values=""):
         row = _FilterRow(self, initial_type, initial_values)
         self.rows_box.addWidget(row)
+
+        # garanta que o botão de ações do row está conectado toda vez que a linha é criada
+        if hasattr(row, "btn_actions"):
+            try:
+                row.btn_actions.clicked.disconnect()
+            except Exception:
+                pass
+            row.btn_actions.clicked.connect(lambda: row.open_actions_menu())
+
         row.btn_remove.clicked.connect(lambda: self._remove_row(row))
 
     def _remove_row(self, row: _FilterRow):
@@ -2010,8 +2087,125 @@ class PeneratorTab(QWidget):
             it.addChild(QTreeWidgetItem([self.DUMMY_MARK, ""]))
 
     # ---------- Botões/Ações por item ----------
+    def replace_selected_names(self, initiator_item: Optional[QTreeWidgetItem] = None):
+        """
+        Executa find/replace no basename dos itens selecionados (ou no 'initiator_item' se não houver seleção).
+        Usa um ÚNICO diálogo (_ReplaceDialog) com dois campos. Não há mais prompts secundários.
+        """
+        # --- coleta de alvos ---
+        selected = self.tree.selectedItems()
+        targets = selected if selected else ([initiator_item] if initiator_item is not None else [])
+        if not targets:
+            QMessageBox.information(self, "Replace", "Nenhum item selecionado.")
+            return
+
+        # --- diálogo único com dois campos ---
+        dlg = _ReplaceDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        find_text, repl_text = dlg.values()
+
+        # proteção mínima: evitar find vazio (substituir "" vira caos)
+        if (find_text or "") == "":
+            QMessageBox.information(self, "Replace", "Texto a buscar está vazio — operação cancelada.")
+            return
+        repl_text = repl_text or ""
+
+        # helpers locais
+        def unique_sibling_path(base_path: Path) -> Path:
+            if not base_path.exists():
+                return base_path
+            stem, suf = base_path.stem, base_path.suffix
+            i = 1
+            cand = base_path.with_name(f"{stem}_{i}{suf}")
+            while cand.exists():
+                i += 1
+                cand = base_path.with_name(f"{stem}_{i}{suf}")
+            return cand
+
+        def update_children_fullpaths(node: QTreeWidgetItem, old_root: Path, new_root: Path):
+            for j in range(node.childCount()):
+                ch = node.child(j)
+                ch_fp = ch.data(0, self.ROLE_FULLPATH)
+                if ch_fp:
+                    try:
+                        ch_path = Path(str(ch_fp))
+                        rel = ch_path.relative_to(old_root)
+                        ch.setData(0, self.ROLE_FULLPATH, str(new_root / rel))
+                    except Exception:
+                        pass
+                update_children_fullpaths(ch, old_root, new_root)
+
+        changed = 0
+        failed = 0
+
+        for it in targets:
+            try:
+                old_fp = it.data(0, self.ROLE_FULLPATH)
+                old_name = it.text(0)
+                new_name = old_name.replace(find_text, repl_text)
+
+                # se nada mudou, segue para o próximo (sem pré-checagem obrigatória)
+                if new_name == old_name:
+                    continue
+
+                if not old_fp:
+                    # apenas UI
+                    it.setText(0, new_name)
+                    changed += 1
+                    continue
+
+                old_path = Path(str(old_fp))
+                new_path = unique_sibling_path(old_path.with_name(new_name))
+                try:
+                    new_path.parent.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+
+                try:
+                    shutil.move(str(old_path), str(new_path))
+                except Exception as e:
+                    QMessageBox.critical(self, "Replace", f"Falha ao renomear '{old_path.name}': {e}")
+                    failed += 1
+                    continue
+
+                # atualiza UI e ROLE_FULLPATH
+                it.setText(0, new_path.name)
+                it.setData(0, self.ROLE_FULLPATH, str(new_path))
+
+                if bool(it.data(0, self.ROLE_IS_DIR)):
+                    try:
+                        update_children_fullpaths(it, old_path, new_path)
+                    except Exception:
+                        pass
+
+                changed += 1
+
+            except Exception:
+                failed += 1
+                continue
+
+        # feedback
+        if failed == 0 and changed == 0:
+            QMessageBox.information(self, "Replace", "Nenhum nome foi alterado.")
+        elif failed == 0:
+            QMessageBox.information(self, "Replace", f"Renomeados: {changed}")
+        else:
+            QMessageBox.warning(self, "Replace", f"Renomeados: {changed}\nFalhas: {failed}")
+
     def _ensure_buttons(self, item: QTreeWidgetItem):
+        """Gera/rega os botões de ação do nó (idempotente) e inclui 'Replace…'."""
         from PySide6.QtWidgets import QMenu, QWidget, QHBoxLayout
+
+        # Remover widget antigo (se houver) para evitar duplicação
+        old = self.tree.itemWidget(item, 1)
+        if old:
+            self.tree.removeItemWidget(item, 1)
+            try:
+                old.deleteLater()
+            except Exception:
+                pass
+
         w = QWidget()
         h = QHBoxLayout(w)
         h.setContentsMargins(0, 0, 0, 0)
@@ -2028,17 +2222,16 @@ class PeneratorTab(QWidget):
 
         def persistent_menu():
             menu = QMenu(self)
-
             act_sib = menu.addAction("+ Irmão")
             act_child = menu.addAction("+ Filho")
             act_child.setEnabled(is_dir)
             act_rename = menu.addAction("Renomear")
-            act_rename_replace = menu.addAction("Renomear (replace…)")
-
+            act_replace = menu.addAction("Renomear (replace…)")  # << NOVO
+            menu.addSeparator()
             act_sel_one = menu.addAction("Selecionar")
             act_sel_children = menu.addAction("Selecionar todas as filhas")
             act_sel_siblings = menu.addAction("Selecionar todas as irmãs")
-
+            menu.addSeparator()
             act_del = menu.addAction("Remover")
 
             chosen = menu.exec(b_more.mapToGlobal(QPoint(0, b_more.height())))
@@ -2052,24 +2245,15 @@ class PeneratorTab(QWidget):
             elif chosen == act_rename:
                 idx = self.tree.indexFromItem(item, 0)
                 self.tree.edit(idx)
-            elif chosen == act_rename_replace:
-                targets = self.tree.selectedItems() or [item]
-                old_names_preview = targets[0].text(0) if targets else ""
-                dlg = ReplaceDialog(self, current_name=old_names_preview)
-                if dlg.exec() == QDialog.Accepted:
-                    find_text, repl_text = dlg.values()
-                    find_text = (find_text or "").strip()
-                    repl_text = (repl_text or "").strip()
-                    if not find_text:
-                        QMessageBox.information(self, "Replace", "Texto a buscar está vazio — operação cancelada.")
-                    else:
-                        apply_replace_to_targets(self, targets, find_text, repl_text)
+            elif chosen == act_replace:
+                # aplica replace aos itens selecionados; se não houver seleção, usa o 'item'
+                self.replace_selected_names(initiator_item=item)
             elif chosen == act_sel_one:
                 self.tree.clearSelection()
                 item.setSelected(True)
             elif chosen == act_sel_children:
                 self.tree.clearSelection()
-                def _select_recursive(node: QTreeWidgetItem):
+                def _select_recursive(node):
                     for i in range(node.childCount()):
                         ch = node.child(i)
                         ch.setSelected(True)
@@ -2091,82 +2275,9 @@ class PeneratorTab(QWidget):
                         if sib is not item:
                             sib.setSelected(True)
             elif chosen == act_del:
-                # --- remover item: tentar apagar no disco quando possível ---
-                # Se for pasta/arquivo com ROLE_FULLPATH, pedir confirmação e tentar excluir.
-                full = item.data(0, self.ROLE_FULLPATH)
-                is_dir = bool(item.data(0, self.ROLE_IS_DIR))
-                if full:
-                    p = Path(str(full))
-                    if not p.exists():
-                        # não existe no disco -> remover do UI sem perguntar
-                        if parent := item.parent():
-                            parent.takeChild(parent.indexOfChild(item))
-                        else:
-                            self.tree.takeTopLevelItem(self.tree.indexOfTopLevelItem(item))
-                        QMessageBox.information(self, "Remover", "Item removido da árvore (não existia no disco).")
-                    else:
-                        # confirmar exclusão no disco
-                        if is_dir:
-                            txt = f"Remover a pasta no disco?\n\n{p}\n\n(Se a pasta não estiver vazia você poderá optar por remoção recursiva.)"
-                        else:
-                            txt = f"Remover o arquivo no disco?\n\n{p}"
-                        resp = QMessageBox.question(self, "Confirmar remoção", txt, QMessageBox.Yes | QMessageBox.No)
-                        if resp == QMessageBox.Yes:
-                            try:
-                                if is_dir:
-                                    try:
-                                        p.rmdir()  # tenta remover se vazia
-                                        removed_ok = True
-                                    except OSError:
-                                        # não vazia -> perguntar remoção recursiva
-                                        force = QMessageBox.question(
-                                            self, "Pasta não vazia",
-                                            "A pasta não está vazia. Deseja apagar recursivamente TODO o conteúdo?",
-                                            QMessageBox.Yes | QMessageBox.No
-                                        )
-                                        if force == QMessageBox.Yes:
-                                            try:
-                                                shutil.rmtree(str(p))
-                                                removed_ok = True
-                                            except Exception as e:
-                                                removed_ok = False
-                                                QMessageBox.critical(self, "Erro", f"Falha ao apagar recursivamente: {e}")
-                                        else:
-                                            removed_ok = False
-                                else:
-                                    # arquivo
-                                    try:
-                                        p.unlink()
-                                        removed_ok = True
-                                    except Exception as e:
-                                        removed_ok = False
-                                        QMessageBox.critical(self, "Erro", f"Falha ao remover arquivo: {e}")
-                            except Exception as e:
-                                removed_ok = False
-                                QMessageBox.critical(self, "Erro", f"Falha ao remover: {e}")
-
-                            if removed_ok:
-                                # remover do UI
-                                parent = item.parent()
-                                if parent:
-                                    parent.takeChild(parent.indexOfChild(item))
-                                else:
-                                    self.tree.takeTopLevelItem(self.tree.indexOfTopLevelItem(item))
-                                QMessageBox.information(self, "Remover", "Item removido com sucesso (disco + árvore).")
-                            else:
-                                # não removido do disco (usuário cancelou ou erro) -> não tocar na UI
-                                pass
-                else:
-                    # não há path no disco; apenas remover da árvore
-                    parent = item.parent()
-                    if parent:
-                        parent.takeChild(parent.indexOfChild(item))
-                    else:
-                        self.tree.takeTopLevelItem(self.tree.indexOfTopLevelItem(item))
-                    QMessageBox.information(self, "Remover", "Item removido da árvore.")
+                self.remove_item(item)
 
         b_more.clicked.connect(persistent_menu)
-
         h.addWidget(b_plus)
         h.addWidget(b_more)
         h.addStretch(1)
@@ -2934,6 +3045,7 @@ class PeneratorTab(QWidget):
         except Exception:
             # não quebrar o fluxo principal por causa do undo
             pass
+
 
 def _choose_open_file(parent, title="Abrir arquivo", name_filter=""):
     dlg = QFileDialog(parent, title)
