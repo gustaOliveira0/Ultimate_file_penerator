@@ -1457,7 +1457,7 @@ class HierarchyTab(QWidget):
 class _FilterRow(QWidget):
     TYPES = ["Resolução (maior lado)", "Extensão", "Perfil de cor", "Data"]
 
-    def __init__(self, parent=None, initial_type="extensão", initial_values=""):
+    def __init__(self, parent=None, initial_type="extensão", initial_values="", initial_concat=""):
         super().__init__(parent)
 
         g = QGridLayout(self)
@@ -1465,12 +1465,13 @@ class _FilterRow(QWidget):
         g.setHorizontalSpacing(6)
         g.setVerticalSpacing(4)
 
+        # Tipo de filtro
         self.type_cb = QComboBox()
         self.type_cb.addItems(self.TYPES)
         self.type_cb.setMinimumContentsLength(14)
         self.type_cb.setFixedHeight(28)
 
-        # 🔧 Seleção do tipo, tolerante a variações (minúsculas, prefixos)
+        # Seleção tolerante a variações
         wanted = (initial_type or "").strip().lower()
         if wanted:
             for t in self.TYPES:
@@ -1478,36 +1479,50 @@ class _FilterRow(QWidget):
                     self.type_cb.setCurrentText(t)
                     break
 
+        # Campo de valores
         self.values_edit = QLineEdit()
         self.values_edit.setPlaceholderText("valores separados por vírgula")
         self.values_edit.setFixedHeight(28)
-        # 🔧 PREENCHE os valores iniciais vindos do template
         self.values_edit.setText(initial_values)
 
+        # NOVO: Campo de concatenação personalizada
+        self.concat_edit = QLineEdit()
+        self.concat_edit.setPlaceholderText("concatenação (ex.: 5k,6k,7k)")
+        self.concat_edit.setFixedHeight(28)
+        self.concat_edit.setText(initial_concat or "")
+
+        # Botão de remover
         self.btn_remove = QToolButton()
         self.btn_remove.setText("−")
         self.btn_remove.setToolTip("Remover filtro")
         self.btn_remove.setAutoRaise(True)
         self.btn_remove.setFixedSize(22, 22)
 
+        # Estilos compactos
         self.type_cb.setStyleSheet("QComboBox{padding:2px 6px;}")
         self.values_edit.setStyleSheet("QLineEdit{padding:2px 6px;}")
+        self.concat_edit.setStyleSheet("QLineEdit{padding:2px 6px;}")
         self.btn_remove.setStyleSheet("QToolButton{padding:0px;}")
 
-        g.addWidget(self.type_cb,    0, 0)
-        g.addWidget(self.values_edit,0, 1)
-        g.addWidget(self.btn_remove, 0, 2)
+        # Layout: tipo | valores | concatenação | remover
+        g.addWidget(self.type_cb,     0, 0)
+        g.addWidget(self.values_edit, 0, 1)
+        g.addWidget(self.concat_edit, 0, 2)
+        g.addWidget(self.btn_remove,  0, 3)
 
         g.setColumnStretch(0, 0)
         g.setColumnStretch(1, 1)
-        g.setColumnStretch(2, 0)
+        g.setColumnStretch(2, 1)
+        g.setColumnStretch(3, 0)
 
-    def spec(self) -> Tuple[str, List[str]]:
+    def spec(self) -> Tuple[str, List[str], List[str]]:
+        """Retorna (tipo, lista de valores, lista de concatenações)."""
         ftype = self.type_cb.currentText().strip().lower()
-        raw = self.values_edit.text()
-        vals = [v.strip() for v in raw.split(",") if v.strip()]
-        return ftype, vals
+        raw_vals = self.values_edit.text()
+        raw_concat = self.concat_edit.text()
 
+        vals = [v.strip() for v in raw_vals.split(",") if v.strip()]
+        concats = [v.strip() for v in raw_concat.split(",") if v.strip()]
 
 class PeneratorDialog(QDialog):
     def _normalize_type_label(self, label: str) -> str:
@@ -1539,7 +1554,12 @@ class PeneratorDialog(QDialog):
         for entry in spec:
             t = self._normalize_type_label(str(entry.get("type", "")))
             vals = ",".join(entry.get("values", []))
+            concats = ",".join(entry.get("concats", [])) if "concats" in entry else ""
             self._add_row(t, vals)
+            # aplica concat se disponível
+            last_row = self.rows_box.itemAt(self.rows_box.count() - 1).widget()
+            if hasattr(last_row, "concat_edit"):
+                last_row.concat_edit.setText(concats)
         if self.rows_box.count() == 0:
             self._add_row("Extensão", "")
             self._add_row("Resolução (maior lado)", "")
@@ -1614,8 +1634,16 @@ class PeneratorDialog(QDialog):
                 return
         # coleta → normaliza para [{type, values}]
         entries = []
-        for t, vals in self._collect_current_filters():
-            entries.append({"type": t, "values": vals})
+        for i in range(self.rows_box.count()):
+            w = self.rows_box.itemAt(i).widget()
+            if isinstance(w, _FilterRow):
+                t, vals, concats = w.spec()
+        if vals:
+            entry = {"type": t, "values": vals}
+            if concats:
+                entry["concats"] = concats
+            entries.append(entry)
+
         if not entries:
             QMessageBox.information(self, "Templates de filtros", "Não há filtros para salvar.")
             return
@@ -1819,7 +1847,7 @@ class PeneratorDialog(QDialog):
         _center_dialog(self, parent)
 
     def _add_row(self, initial_type="extensão", initial_values=""):
-        row = _FilterRow(self, initial_type, initial_values)
+        row = _FilterRow(self, initial_type, initial_values, "")
         self.rows_box.addWidget(row)
 
         # garanta que o botão de ações do row está conectado toda vez que a linha é criada
@@ -1840,13 +1868,13 @@ class PeneratorDialog(QDialog):
         """
         Retorna: (filters, ask_replicate:bool, concat_suffix:bool, use_copy:bool)
         """
-        filters: List[Tuple[str, List[str]]] = []
+        filters: List[Tuple[str, List[str], List[str]]] = []
         for i in range(self.rows_box.count()):
             w = self.rows_box.itemAt(i).widget()
             if isinstance(w, _FilterRow):
-                t, vals = w.spec()
+                t, vals, concats = w.spec()
                 if vals:
-                    filters.append((t, vals))
+                    filters.append((t, vals, concats))
         return filters, self.cb_replicate.isChecked(), self.cb_concat_suffix.isChecked(), self.cb_copy.isChecked()
 
 
@@ -2871,12 +2899,21 @@ class PeneratorTab(QWidget):
 
             if ftype.startswith("resolução"):
                 try:
-                    targets = {int(v) for v in vals}
+                    # converte todos os valores digitados para inteiros válidos
+                    targets = [int(v) for v in vals if str(v).strip().isdigit()]
                 except Exception:
                     return None
                 if largest is None:
                     return None
-                return str(largest) if largest in targets else None
+
+                # verifica se o valor está dentro de algum intervalo [N000, N999]
+                for base in targets:
+                    low = base
+                    high = base + 999
+                    if low <= largest <= high:
+                        # retorna o rótulo de base (ex.: "5000")
+                        return str(base)
+                return None
 
             if ftype == "extensão":
                 ext = p.suffix.lower().lstrip(".")
@@ -2919,12 +2956,22 @@ class PeneratorTab(QWidget):
                 matched_labels: List[Tuple[str, str]] = []
 
                 # aplicar cada filtro sequencialmente; se casar => desce para esse nível
-                for ftype, vals in filters:
+                for ftype, vals, concats in filters:
                     lab = match_and_label(p, info, ftype, vals)
                     if lab is not None:
                         safe = str(lab).replace("/", "-")
                         cur_dir = cur_dir / safe
-                        matched_labels.append((ftype, lab))
+
+                        # tentar achar concatenação correspondente
+                        concat_label = None
+                        try:
+                            idx = vals.index(str(lab))
+                            if idx < len(concats):
+                                concat_label = concats[idx]
+                        except Exception:
+                            pass
+
+                        matched_labels.append((ftype, lab, concat_label))
 
                 # se não casou em nenhum filtro -> ignorar (comportamento atual)
                 if not matched_labels:
@@ -2962,15 +3009,19 @@ class PeneratorTab(QWidget):
                 new_stem = orig_stem
                 if concat_suffix:
                     suffix_tokens: List[str] = []
-                    for ftype, lab in matched_labels:
+                    for ftype, lab, concat_label in matched_labels:
                         ft_lower = ftype.lower()
+
+                        # usa concatenação personalizada se existir
+                        if concat_label:
+                            suffix_tokens.append(concat_label)
+                            continue
+
+                        # fallback para comportamento padrão (antigo)
                         if ft_lower == "extensão":
-                            continue  # não concatenar extensão
+                            continue
                         if ft_lower.startswith("resolução"):
-                            try:
-                                suffix_tokens.append(self._suffix_from_resolution_label(str(lab)))
-                            except Exception:
-                                suffix_tokens.append(re.sub(r"[^0-9a-zA-Z]+", "", str(lab)))
+                            suffix_tokens.append(self._suffix_from_resolution_label(str(lab)))
                         elif ft_lower.startswith("perfil"):
                             suffix_tokens.append(re.sub(r"[^0-9a-zA-Z]+", "", str(lab)))
                         elif ft_lower.startswith("data"):
