@@ -1,0 +1,5 @@
+# Interface gráfica
+PySide6>=6.5.0
+
+# Manipulação de imagens (para filtros de resolução)
+Pillow>=10.0.0

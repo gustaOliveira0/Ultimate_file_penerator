@@ -1454,6 +1454,8 @@ class HierarchyTab(QWidget):
             QApplication.restoreOverrideCursor()
         except Exception:
             pass
+
+
 class _FilterRow(QWidget):
     TYPES = ["Resolução (maior lado)", "Extensão", "Perfil de cor", "Data"]
 
