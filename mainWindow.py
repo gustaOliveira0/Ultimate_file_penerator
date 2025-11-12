@@ -51,16 +51,6 @@ def _choose_save_file(parent, title="Salvar como", name_filter=""):
         return (files[0], name_filter) if files else ("", name_filter)
     return ("", name_filter)
 
-def _choose_directory(parent, title="Escolher pasta"):
-    dlg = QFileDialog(parent, title)
-    dlg.setOption(QFileDialog.DontUseNativeDialog, True)
-    dlg.setFileMode(QFileDialog.Directory)
-    dlg.setOption(QFileDialog.ShowDirsOnly, True)
-    if dlg.exec() == QDialog.Accepted:
-        files = dlg.selectedFiles()
-        return files[0] if files else ""
-    return ""
-
 
 class MainWindow(QMainWindow):
     def __init__(self):

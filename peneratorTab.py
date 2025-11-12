@@ -2,6 +2,7 @@ from PySide6.QtCore import Qt, QTimer, QObject, QEvent, QPoint, QRect
 from PySide6.QtGui import QKeySequence, QShortcut
 from typing import Optional, List, Dict, Any
 from pathlib import Path
+import os
 from typing import Any, Dict, Optional, List, Tuple, Set
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
@@ -16,13 +17,16 @@ from PySide6.QtWidgets import (
 )
 def _choose_directory(parent, title="Escolher pasta"):
     dlg = QFileDialog(parent, title)
-    dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+    # use o diálogo nativo (grande, igual ao HierarchyTab)
+    dlg.setOption(QFileDialog.DontUseNativeDialog, False)  # <<< alterado
     dlg.setFileMode(QFileDialog.Directory)
     dlg.setOption(QFileDialog.ShowDirsOnly, True)
+    dlg.setMinimumSize(1000, 700)  # <<< opcional: força tamanho grande inicial
     if dlg.exec() == QDialog.Accepted:
         files = dlg.selectedFiles()
         return files[0] if files else ""
     return ""
+
 
 
 class PeneratorTab(QWidget):
@@ -181,13 +185,38 @@ class PeneratorTab(QWidget):
             p = Path(base_dir)
             if not p.exists() or not p.is_dir():
                 raise FileNotFoundError("Pasta inválida")
-            root = self._make_dir_item(p.name, str(p))
-            self.tree.addTopLevelItem(root)
-            self._ensure_buttons(root)
-            root.addChild(QTreeWidgetItem([self.DUMMY_MARK, ""]))
-            self.tree.expandItem(root)
+
+            with os.scandir(p) as it:
+                dirs, files = [], []
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=True):
+                            dirs.append(e)
+                        elif e.is_file(follow_symlinks=True):
+                            files.append(e)
+                    except Exception:
+                        continue
+
+            dirs.sort(key=lambda e: e.name.lower())
+            files.sort(key=lambda e: e.name.lower())
+
+            for d in dirs:
+                ch = self._make_dir_item(d.name, d.path)
+                self.tree.addTopLevelItem(ch)
+                self._ensure_buttons(ch)
+                ch.addChild(QTreeWidgetItem([self.DUMMY_MARK, ""]))
+
+            for f in files:
+                ch = self._make_file_item(f.name, f.path)
+                self.tree.addTopLevelItem(ch)
+                self._ensure_buttons(ch)
+
+            # Habilita o botão Penerator se tiver conteúdo
+            self.btn_penerator.setEnabled(bool(dirs or files))
+
         except Exception as e:
             QMessageBox.critical(self, "Erro", f"Falha ao abrir: {e}")
+
 
     def _make_item(self, name: str, is_dir: bool) -> QTreeWidgetItem:
         it = QTreeWidgetItem([name, ""])
